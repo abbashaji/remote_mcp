@@ -16,6 +16,15 @@ compatibility_flags = ["nodejs_compat"]
 binding = "OAUTH_KV"
 id = "587f72d065cb45e1b3c0a68d556cafe5"
 
+# Non-secret config, safe to commit. WORKER_URL is this Worker's own
+# https://....workers.dev base URL -- CodeCellWorkflow's
+# fast-worker-dispatch step needs it to publish a QStash message back to
+# this same Worker's own /qstash/fast-worker-generate route (Section 4f;
+# see code_cell_workflow.ts and auth.ts). Update this if the Worker is
+# ever renamed or moved to a custom domain.
+[vars]
+WORKER_URL = "https://turso-github-mcp.intorie.workers.dev"
+
 # JobWorkflow (workflows.ts): a generic multi-step durable job. Triggered
 # via the workflow_* MCP tools.
 [[workflows]]
@@ -36,14 +45,14 @@ new_sqlite_classes = ["TaskRunner"]
 
 # CodeCellWorkflow (code_cell_workflow.ts): Section 4f's durable per-cell
 # pipeline (Fast Worker -> Heavy Worker -> tag -> notify). Triggered via
-# the cell_create MCP tool; resumed by /webhook/heavy-worker-result
-# (auth.ts) via step.waitForEvent.
+# the cell_create MCP tool; resumed by /webhook/heavy-worker-result and
+# /qstash/fast-worker-generate (auth.ts) via step.waitForEvent.
 [[workflows]]
 binding = "CODE_CELL_WORKFLOW"
 name = "turso-github-mcp-code-cell-workflow"
 class_name = "CodeCellWorkflow"
 
-# Secrets (set with `wrangler secret put <NAME>`, never in this file or
+# Secrets (set with `wrangler secret put <n>`, never in this file or
 # in a committed .dev.vars):
 #   MCP_AUTH_TOKEN        -- password that gates the /authorize consent
 #                            screen; only you should know it
@@ -69,10 +78,10 @@ class_name = "CodeCellWorkflow"
 #   NEO4J_URI             -- e.g. "neo4j+s://xxxx.databases.neo4j.io" (Aura)
 #                            or "https://host:7474" (self-hosted). Talks to
 #                            the HTTP Query API, not Bolt.
-#   NEO4J_USERNAME        -- HTTP Basic auth, sent per-request.
-#   NEO4J_PASSWORD        -- HTTP Basic auth, sent per-request.
-#   NEO4J_DATABASE        -- optional, defaults to "neo4j".
-#   UPSTASH_EMAIL         -- Upstash account email, for the Developer
+#   NEO4J_USERNAME         -- HTTP Basic auth, sent per-request.
+#   NEO4J_PASSWORD         -- HTTP Basic auth, sent per-request.
+#   NEO4J_DATABASE         -- optional, defaults to "neo4j".
+#   UPSTASH_EMAIL          -- Upstash account email, for the Developer
 #                            (Management) API at api.upstash.com. Paired
 #                            with UPSTASH_API_KEY as HTTP Basic auth.
 #                            NOTE: this key type is account-wide -- it can
@@ -97,7 +106,9 @@ class_name = "CodeCellWorkflow"
 #                            credential as UPSTASH_EMAIL/UPSTASH_API_KEY
 #                            above -- those manage Redis databases via a
 #                            different API, this publishes/schedules
-#                            messages via qstash.upstash.io. Powers qstash_*.
+#                            messages via qstash.upstash.io. Powers qstash_*
+#                            AND CodeCellWorkflow's fast-worker-dispatch
+#                            step (Section 4f).
 #
 # --- CodeCellWorkflow-specific (code_cell_workflow.ts) ---------------------
 #   HEAVY_WORKER_REPO         -- "owner/name" of the repo containing
@@ -119,3 +130,34 @@ class_name = "CodeCellWorkflow"
 #                                tags (needs_human, dead_letter) get
 #                                posted to. Optional -- alerts are skipped
 #                                if unset. Reuses DISCORD_BOT_TOKEN above.
+#   FAST_WORKER_CALLBACK_TOKEN -- a random secret (e.g. `openssl rand -hex
+#                                32`), checked on POST
+#                                /qstash/fast-worker-generate. Deliberately
+#                                separate from MCP_AUTH_TOKEN and
+#                                HEAVY_WORKER_CALLBACK_TOKEN -- this one
+#                                gates the QStash-paced Fast Worker
+#                                dispatch route (Section 4f), forwarded on
+#                                each publish via the
+#                                Upstash-Forward-Authorization header (see
+#                                code_cell_workflow.ts's fast-worker-
+#                                dispatch step). Nothing external needs to
+#                                know this value -- unlike
+#                                HEAVY_WORKER_CALLBACK_TOKEN it is never
+#                                set anywhere outside this Worker.
+#   FAST_WORKER_RATE_PER_MINUTE -- optional PLAINTEXT var (not a secret --
+#                                fine to set via `wrangler secret put` or
+#                                add to [vars] above), defaults to "20" if
+#                                unset. Caps how many CodeCells' Fast
+#                                Worker dispatches QStash releases per
+#                                minute, across every concurrently-running
+#                                CodeCellWorkflow instance combined (see
+#                                Section 2's QStash row on the disputed
+#                                Groq daily-cap figures -- start
+#                                conservative and raise once you've
+#                                confirmed your account's actual
+#                                rate-limit-remaining/-reset headers).
+#   FAST_WORKER_PARALLELISM   -- optional, unset by default (no
+#                                parallelism cap, rate-only pacing). Caps
+#                                how many fast-worker-generate calls can
+#                                be in flight at once across every
+#                                instance.
