@@ -109,6 +109,18 @@ class_name = "CodeCellWorkflow"
 #                            messages via qstash.upstash.io. Powers qstash_*
 #                            AND CodeCellWorkflow's fast-worker-dispatch
 #                            step (Section 4f).
+#   QSTASH_URL            -- optional, defaults to https://qstash.upstash.io.
+#                            REQUIRED if your Upstash account is
+#                            region-provisioned (e.g. EU) rather than the
+#                            global default -- a region-scoped QSTASH_TOKEN
+#                            fails auth ("invalid token", 401) against the
+#                            global endpoint with no hint it's a region
+#                            mismatch. Check the QStash tab at
+#                            https://console.upstash.com for a QSTASH_URL
+#                            line alongside QSTASH_TOKEN; if present, set
+#                            it here verbatim (e.g.
+#                            "https://qstash-eu-central-1.upstash.io", no
+#                            trailing /v2 -- that's added automatically).
 #
 # --- CodeCellWorkflow-specific (code_cell_workflow.ts) ---------------------
 #   HEAVY_WORKER_REPO         -- "owner/name" of the repo containing
