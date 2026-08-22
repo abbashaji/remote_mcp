@@ -1,0 +1,23 @@
+{
+  "name": "turso-github-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.10.3",
+    "@libsql/client": "^0.15.15",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260818.1",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.124.0"
+  }
+}
