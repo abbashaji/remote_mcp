@@ -58,6 +58,7 @@ export interface Env {
   DISCORD_BOT_TOKEN?: string;
   GEMINI_API_KEY?: string;
   QSTASH_TOKEN?: string;
+  QSTASH_URL?: string; // optional region override, e.g. "https://qstash-eu-central-1.upstash.io" -- see qstash.ts
   JOB_WORKFLOW: Workflow<import("./workflows").JobWorkflowParams>;
   RUNNER: DurableObjectNamespace<TaskRunner>;
   CODE_CELL_WORKFLOW: Workflow<import("./code_cell_workflow").CodeCellWorkflowParams>;
