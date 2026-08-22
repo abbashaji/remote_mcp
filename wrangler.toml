@@ -1,0 +1,121 @@
+name = "turso-github-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Free tier: 100,000 requests/day. The only "infrastructure" this needs
+# beyond the Worker itself is a KV namespace, which @cloudflare/workers-
+# oauth-provider uses to store OAuth client registrations, grants, and
+# token hashes (never raw secrets -- see the library's README). Create
+# it once with:
+#
+#   npx wrangler kv namespace create OAUTH_KV
+#
+# then paste the "id" it prints into the binding below.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "587f72d065cb45e1b3c0a68d556cafe5"
+
+# JobWorkflow (workflows.ts): a generic multi-step durable job. Triggered
+# via the workflow_* MCP tools.
+[[workflows]]
+binding = "JOB_WORKFLOW"
+name = "turso-github-mcp-job-workflow"
+class_name = "JobWorkflow"
+
+# TaskRunner (runner.ts): a persistent per-name Durable Object actor with
+# its own task queue, driven via the runner_* MCP tools. SQLite-backed
+# storage (new_sqlite_classes) is the current default for new DO classes.
+[[durable_objects.bindings]]
+name = "RUNNER"
+class_name = "TaskRunner"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TaskRunner"]
+
+# CodeCellWorkflow (code_cell_workflow.ts): Section 4f's durable per-cell
+# pipeline (Fast Worker -> Heavy Worker -> tag -> notify). Triggered via
+# the cell_create MCP tool; resumed by /webhook/heavy-worker-result
+# (auth.ts) via step.waitForEvent.
+[[workflows]]
+binding = "CODE_CELL_WORKFLOW"
+name = "turso-github-mcp-code-cell-workflow"
+class_name = "CodeCellWorkflow"
+
+# Secrets (set with `wrangler secret put <NAME>`, never in this file or
+# in a committed .dev.vars):
+#   MCP_AUTH_TOKEN        -- password that gates the /authorize consent
+#                            screen; only you should know it
+#   GITHUB_TOKEN          -- PAT with repo + workflow scopes
+#   TURSO_DATABASE_URL    -- e.g. libsql://your-db.turso.io
+#   TURSO_AUTH_TOKEN      -- from `turso db tokens create <database-name>`
+#   DISCORD_BOT_TOKEN     -- bot token from https://discord.com/developers/
+#                            applications (Bot tab -> Reset Token). Invite
+#                            the bot to each server it needs to act in,
+#                            with the relevant permissions (Send Messages,
+#                            Manage Channels, Add Reactions, etc.).
+#   CLOUDFLARE_API_TOKEN  -- scoped API token (NOT the Global API Key) for
+#                            the cloudflare_search/cloudflare_execute
+#                            proxy tools, which forward to Cloudflare's
+#                            own mcp.cloudflare.com server. Create one at
+#                            https://dash.cloudflare.com/profile/api-tokens
+#                            with only the scopes you want this connector
+#                            to have -- e.g. Workers Scripts:Edit (to let
+#                            it redeploy this Worker), Workflows:Edit,
+#                            Account Settings:Read. This token effectively
+#                            becomes this connector's permission ceiling
+#                            for all of Cloudflare, so scope it narrowly.
+#   NEO4J_URI             -- e.g. "neo4j+s://xxxx.databases.neo4j.io" (Aura)
+#                            or "https://host:7474" (self-hosted). Talks to
+#                            the HTTP Query API, not Bolt.
+#   NEO4J_USERNAME        -- HTTP Basic auth, sent per-request.
+#   NEO4J_PASSWORD        -- HTTP Basic auth, sent per-request.
+#   NEO4J_DATABASE        -- optional, defaults to "neo4j".
+#   UPSTASH_EMAIL         -- Upstash account email, for the Developer
+#                            (Management) API at api.upstash.com. Paired
+#                            with UPSTASH_API_KEY as HTTP Basic auth.
+#                            NOTE: this key type is account-wide -- it can
+#                            manage every Redis database on the account,
+#                            not just one, so treat it accordingly.
+#   UPSTASH_API_KEY       -- see UPSTASH_EMAIL above.
+#   GROQ_API_KEY          -- from https://console.groq.com/keys, for the
+#                            groq_* fast-inference tools.
+#   POSTHOG_API_KEY       -- PostHog Personal API key (bearer token),
+#                            proxied through to PostHog's own hosted
+#                            remote MCP server.
+#   POSTHOG_MCP_URL       -- optional, defaults to https://mcp.posthog.com/mcp
+#                            (US region). Set to https://mcp-eu.posthog.com/mcp
+#                            for EU-region PostHog accounts.
+#   GEMINI_API_KEY        -- from https://aistudio.google.com/apikey. Powers
+#                            gemini_* (Fast Worker fallback tiers, Gemma 4
+#                            tagging, response_schema, google_search
+#                            grounding, embeddings) AND antigravity_* (same
+#                            key, different endpoint -- see antigravity.ts).
+#   QSTASH_TOKEN          -- QStash's OWN bearer token (QStash tab at
+#                            https://console.upstash.com), NOT the same
+#                            credential as UPSTASH_EMAIL/UPSTASH_API_KEY
+#                            above -- those manage Redis databases via a
+#                            different API, this publishes/schedules
+#                            messages via qstash.upstash.io. Powers qstash_*.
+#
+# --- CodeCellWorkflow-specific (code_cell_workflow.ts) ---------------------
+#   HEAVY_WORKER_REPO         -- "owner/name" of the repo containing
+#                                .github/workflows/test.yml, e.g.
+#                                "abbashaji/ondine". Reuses GITHUB_TOKEN
+#                                above (needs repo + workflow scopes).
+#   HEAVY_WORKER_CALLBACK_TOKEN -- a random secret ONLY the GitHub Actions
+#                                runner should know (e.g. `openssl rand
+#                                -hex 32`), checked on POST
+#                                /webhook/heavy-worker-result. Deliberately
+#                                separate from MCP_AUTH_TOKEN, which gates
+#                                the human /authorize screen. Set as a
+#                                repo secret of the same name in
+#                                HEAVY_WORKER_REPO's Settings -> Secrets
+#                                and variables -> Actions, alongside
+#                                GATEWAY_URL (this Worker's own
+#                                https://....workers.dev base URL).
+#   DISCORD_ALERT_CHANNEL_ID  -- channel (snowflake id) urgent CodeCell
+#                                tags (needs_human, dead_letter) get
+#                                posted to. Optional -- alerts are skipped
+#                                if unset. Reuses DISCORD_BOT_TOKEN above.
