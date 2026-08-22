@@ -64,6 +64,10 @@ export interface Env {
   DISCORD_ALERT_CHANNEL_ID?: string;
   HEAVY_WORKER_REPO?: string; // "owner/name" -- repo containing .github/workflows/test.yml
   HEAVY_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /webhook/heavy-worker-result
+  WORKER_URL?: string; // this Worker's own https://....workers.dev base URL (Section 4f QStash self-dispatch)
+  FAST_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /qstash/fast-worker-generate
+  FAST_WORKER_RATE_PER_MINUTE?: string; // optional, defaults to "20" -- see code_cell_workflow.ts
+  FAST_WORKER_PARALLELISM?: string; // optional -- see code_cell_workflow.ts
 }
 
 function text(s: string) {
@@ -597,24 +601,44 @@ function buildServer(env: Env): McpServer {
   // SEPARATE product and credential from upstash_* above (which manages
   // Redis databases via api.upstash.com) -- see qstash.ts. This is
   // Section 4 step 3's "Traffic Control" pacing layer and Section 4a's
-  // dead-letter backstop cron.
+  // dead-letter backstop cron, and (as of Section 4f) the cross-instance
+  // pacing layer in front of CodeCellWorkflow's fast-worker-dispatch
+  // step -- flow_control_key/rate/parallelism/period below let you drive
+  // the same header-based mechanism manually, e.g. to test a key before
+  // wiring it into code.
 
   server.registerTool(
     "qstash_publish",
     {
       description:
-        "Publish a one-off message to a destination URL via QStash, with optional delay/retries/callback " +
-        "-- the pacing layer for bursts of outbound calls (Section 4 step 3).",
+        "Publish a one-off message to a destination URL via QStash, with optional delay/retries/callback/" +
+        "flow-control -- the pacing layer for bursts of outbound calls (Section 4 step 3 / 4f).",
       inputSchema: {
         destination_url: z.string().describe("Full https URL QStash will POST to"),
         body: z.any().describe("JSON body delivered to the destination"),
         delay_seconds: z.number().int().optional(),
         retries: z.number().int().optional(),
         callback_url: z.string().optional().describe("URL QStash calls back with the destination's response"),
+        flow_control_key: z
+          .string()
+          .optional()
+          .describe("Shared pacing key -- every publish using the same key competes for the same rate/parallelism budget, across callers and instances."),
+        flow_control_rate: z.number().int().optional().describe("Max calls per flow_control_period for this key (default period: 1s)."),
+        flow_control_parallelism: z.number().int().optional().describe("Max calls in flight at once for this key."),
+        flow_control_period: z.string().optional().describe('e.g. "1m", "30s" -- paired with flow_control_rate.'),
       },
     },
-    async ({ destination_url, body, delay_seconds, retries, callback_url }) =>
-      text(await qstash.qstashPublish(env, destination_url, body, { delaySeconds: delay_seconds, retries, callbackUrl: callback_url })),
+    async ({ destination_url, body, delay_seconds, retries, callback_url, flow_control_key, flow_control_rate, flow_control_parallelism, flow_control_period }) =>
+      text(
+        await qstash.qstashPublish(env, destination_url, body, {
+          delaySeconds: delay_seconds,
+          retries,
+          callbackUrl: callback_url,
+          flowControl: flow_control_key
+            ? { key: flow_control_key, rate: flow_control_rate, parallelism: flow_control_parallelism, period: flow_control_period }
+            : undefined,
+        }),
+      ),
   );
 
   server.registerTool(
