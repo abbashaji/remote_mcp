@@ -3,7 +3,8 @@
 // The "defaultHandler" for @cloudflare/workers-oauth-provider: handles
 // every request that isn't an already-authenticated call to /mcp. In
 // practice that's just GET/POST /authorize -- the human-in-the-loop
-// consent step of the OAuth dance.
+// consent step of the OAuth dance -- plus a couple of machine-to-machine
+// webhook routes that resolve CodeCellWorkflow's durable waits.
 //
 // Since this server has exactly one user (you), "consent" is just:
 // prove you know MCP_AUTH_TOKEN. No accounts, no database of users --
@@ -12,6 +13,7 @@
 // backed by the OAUTH_KV namespace.
 
 import type { Env } from "./index";
+import { generateCode, type FastWorkerEventPayload } from "./code_cell_workflow";
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -39,6 +41,69 @@ export const AuthHandler = {
 
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response("turso-github-mcp: ok\n", { status: 200 });
+    }
+
+    // Section 4f's QStash pacing layer. CodeCellWorkflow's
+    // fast-worker-dispatch step (code_cell_workflow.ts) publishes here
+    // via QStash instead of calling generateCode() in-process, tagged
+    // with a shared Upstash-Flow-Control-Key -- QStash releases the
+    // request to this route only once it's within the configured
+    // rate/parallelism for that key, which is enforced across EVERY
+    // concurrently-running CodeCellWorkflow instance, not just one (the
+    // cross-instance pacing gap Section 4f says Workflows has no
+    // primitive for). This route runs the actual Groq -> Gemini cascade
+    // and resolves the waiting step via sendEvent -- same shape as
+    // /webhook/heavy-worker-result below, just self-triggered by our own
+    // paced publish rather than an external GitHub Actions runner.
+    //
+    // Auth: a shared secret (FAST_WORKER_CALLBACK_TOKEN, separate from
+    // both MCP_AUTH_TOKEN and HEAVY_WORKER_CALLBACK_TOKEN) forwarded by
+    // QStash via the Upstash-Forward-Authorization header on the publish
+    // call -- QStash strips the "Upstash-Forward-" prefix and delivers
+    // the rest verbatim, so this route sees a normal Authorization
+    // header, same check as the heavy-worker route below.
+    if (url.pathname === "/qstash/fast-worker-generate" && request.method === "POST") {
+      if (!env.FAST_WORKER_CALLBACK_TOKEN) {
+        return new Response("Server misconfigured: FAST_WORKER_CALLBACK_TOKEN not set.", { status: 500 });
+      }
+      const auth = request.headers.get("Authorization") || "";
+      if (auth !== `Bearer ${env.FAST_WORKER_CALLBACK_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let body: { cell_id?: number; spec?: string; workflow_instance_id?: string };
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Malformed JSON body.", { status: 400 });
+      }
+      if (!body.workflow_instance_id || !body.spec) {
+        return new Response("workflow_instance_id and spec required.", { status: 400 });
+      }
+      let instance;
+      try {
+        instance = await env.CODE_CELL_WORKFLOW.get(body.workflow_instance_id);
+      } catch (e) {
+        return new Response(`Error looking up workflow instance: ${e}`, { status: 500 });
+      }
+      try {
+        const draft = await generateCode(env, body.spec);
+        const payload: FastWorkerEventPayload = draft;
+        await instance.sendEvent({ type: "fast-worker-result", payload });
+      } catch (e) {
+        // All Fast Worker tiers exhausted inside generateCode() itself
+        // (Groq -> every Gemini/Gemma fallback tier). This is a
+        // legitimate terminal failure, not a transient delivery
+        // problem, so report it to the waiting step via sendEvent
+        // rather than throwing and letting QStash redeliver the same
+        // already-exhausted cascade.
+        const payload: FastWorkerEventPayload = { error: String((e as any)?.message ?? e) };
+        try {
+          await instance.sendEvent({ type: "fast-worker-result", payload });
+        } catch (sendErr) {
+          return new Response(`Error resolving workflow instance after cascade failure: ${sendErr}`, { status: 500 });
+        }
+      }
+      return new Response("ok\n", { status: 200 });
     }
 
     // Section 4 step 6 callback: test.yml's last step (scripts/run_heavy_worker.py)
