@@ -42,17 +42,38 @@ const FALLBACK_TIERS: Array<{ name: string; model: string }> = [
   { name: "gemma-4-26b", model: "gemma-4-26b" },
 ];
 
+const CODE_GEN_INSTRUCTION =
+  "Respond with ONLY the finished code in a single fenced code block " +
+  "(``` ... ```). No preamble, no explanation, no commentary before or " +
+  "after the block -- the block's contents are saved and executed as-is.";
+
+// Extracts the code payload from a Fast Worker response. Providers
+// routinely wrap output in prose ("Here is the function...") and/or a
+// ```lang fenced block even when explicitly told not to -- this strips
+// both so code_cells.code holds only runnable code, never markdown or
+// commentary. Falls back to the trimmed raw response if no fence is
+// found, on the assumption the provider returned bare code.
+function extractCode(raw: string): string {
+  const fenced = raw.match(/```(?:[a-zA-Z0-9_+-]*\n)?([\s\S]*?)```/);
+  if (fenced) {
+    return fenced[1].trim();
+  }
+  return raw.trim();
+}
+
 async function generateCode(env: Env, spec: string): Promise<{ code: string; provider: string }> {
-  const groqResult = await groqChatCompletion(env, "llama-3.3-70b-versatile", [{ role: "user", content: spec }]);
+  const prompt = `${spec}\n\n${CODE_GEN_INSTRUCTION}`;
+
+  const groqResult = await groqChatCompletion(env, "llama-3.3-70b-versatile", [{ role: "user", content: prompt }]);
   if (!groqResult.startsWith("Error ")) {
-    return { code: groqResult, provider: "groq" };
+    return { code: extractCode(groqResult), provider: "groq" };
   }
 
   let lastErr = groqResult;
   for (const tier of FALLBACK_TIERS) {
-    const result = await geminiGenerateContent(env, tier.model, [{ role: "user", content: spec }]);
+    const result = await geminiGenerateContent(env, tier.model, [{ role: "user", content: prompt }]);
     if (!result.startsWith("Error ")) {
-      return { code: result, provider: tier.name };
+      return { code: extractCode(result), provider: tier.name };
     }
     lastErr = result;
   }
