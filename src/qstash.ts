@@ -1,15 +1,26 @@
 // qstash.ts
 //
-// Direct port onto Upstash QSTASH's own REST API
-// (https://qstash.upstash.io/v2) -- this is deliberately a SEPARATE
-// module and a SEPARATE credential from upstash.ts. upstash.ts wraps
-// api.upstash.com, the account-wide Developer/Management API (create,
-// list, delete Redis databases -- and previously nothing else). QStash
-// is a different product with its own dedicated bearer token, scoped
-// only to publishing/scheduling messages -- it cannot touch Redis
-// databases at all. Folding QStash into upstash.ts would have been
-// wrong on both counts (wrong base URL, wrong auth), so it gets its own
-// file and its own secret.
+// Direct port onto Upstash QSTASH's own REST API -- this is deliberately
+// a SEPARATE module and a SEPARATE credential from upstash.ts. upstash.ts
+// wraps api.upstash.com, the account-wide Developer/Management API
+// (create, list, delete Redis databases -- and previously nothing else).
+// QStash is a different product with its own dedicated bearer token,
+// scoped only to publishing/scheduling messages -- it cannot touch Redis
+// databases at all. Folding QStash into upstash.ts would have been wrong
+// on both counts (wrong base URL, wrong auth), so it gets its own file
+// and its own secret.
+//
+// Regional endpoint addendum: QStash accounts provisioned in a specific
+// region (e.g. EU) get a token that is only valid against that region's
+// own base URL (e.g. https://qstash-eu-central-1.upstash.io), NOT the
+// global https://qstash.upstash.io -- a global-endpoint request with a
+// region-scoped token fails auth with a plain "invalid token" 401 that
+// gives no hint it's a region mismatch (confirmed live against this
+// project's own account: the global endpoint 401'd, the account's
+// console showed a qstash-eu-central-1 QSTASH_URL). Same shape as
+// posthog.ts's POSTHOG_MCP_URL region override -- QSTASH_URL below is
+// that same escape hatch, defaulting to the global endpoint so
+// single-region (US-default) accounts need not set anything.
 //
 // This closes the gap the stack doc actually needs QStash for: Section
 // 4 step 3's "Traffic Control" (pacing calls to Fast Workers), and
@@ -34,9 +45,14 @@
 
 export interface QstashEnv {
   QSTASH_TOKEN?: string;
+  QSTASH_URL?: string; // optional region override, e.g. "https://qstash-eu-central-1.upstash.io" -- see file header
 }
 
-const QSTASH_API = "https://qstash.upstash.io/v2";
+const QSTASH_API_DEFAULT = "https://qstash.upstash.io";
+
+function qstashApiBase(env: QstashEnv): string {
+  return (env.QSTASH_URL || QSTASH_API_DEFAULT).replace(/\/+$/, "");
+}
 
 function requireQstashToken(env: QstashEnv): string {
   if (!env.QSTASH_TOKEN) {
@@ -60,7 +76,7 @@ async function qstashFetch(
     ...(opts?.extraHeaders ?? {}),
   };
   if (opts?.body !== undefined) headers["Content-Type"] = "application/json";
-  const resp = await fetch(`${QSTASH_API}${path}`, {
+  const resp = await fetch(`${qstashApiBase(env)}/v2${path}`, {
     method,
     headers,
     body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
