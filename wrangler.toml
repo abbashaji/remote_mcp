@@ -20,8 +20,9 @@ id = "587f72d065cb45e1b3c0a68d556cafe5"
 # https://....workers.dev base URL -- CodeCellWorkflow's
 # fast-worker-dispatch step needs it to publish a QStash message back to
 # this same Worker's own /qstash/fast-worker-generate route (Section 4f;
-# see code_cell_workflow.ts and auth.ts). Update this if the Worker is
-# ever renamed or moved to a custom domain.
+# see code_cell_workflow.ts and auth.ts). Also the base URL Section 7d/7f's
+# graph-embedding-backfill/graph-heartbeat QStash schedules point at.
+# Update this if the Worker is ever renamed or moved to a custom domain.
 [vars]
 WORKER_URL = "https://turso-github-mcp.intorie.workers.dev"
 
@@ -80,7 +81,18 @@ class_name = "CodeCellWorkflow"
 #                            the HTTP Query API, not Bolt.
 #   NEO4J_USERNAME         -- HTTP Basic auth, sent per-request.
 #   NEO4J_PASSWORD         -- HTTP Basic auth, sent per-request.
-#   NEO4J_DATABASE         -- optional, defaults to "neo4j".
+#   NEO4J_DATABASE         -- optional, defaults to "neo4j". IMPORTANT: if
+#                            neo4j_execute_query/graph_* tools ever start
+#                            returning "Database does not exist. Database
+#                            name: 'neo4j'", the Aura instance's actual
+#                            database name doesn't match this default, or
+#                            the instance itself needs waking/resuming --
+#                            check the Aura console (console.neo4j.io) for
+#                            the instance's live status and real database
+#                            name, and set this explicitly if it differs.
+#                            (Observed live against this project's own
+#                            instance while building Section 7 -- flagging
+#                            here so it isn't re-discovered from scratch.)
 #   UPSTASH_EMAIL          -- Upstash account email, for the Developer
 #                            (Management) API at api.upstash.com. Paired
 #                            with UPSTASH_API_KEY as HTTP Basic auth.
@@ -100,7 +112,11 @@ class_name = "CodeCellWorkflow"
 #                            gemini_* (Fast Worker fallback tiers, Gemma 4
 #                            tagging, response_schema, google_search
 #                            grounding, embeddings) AND antigravity_* (same
-#                            key, different endpoint -- see antigravity.ts).
+#                            key, different endpoint -- see antigravity.ts)
+#                            AND graph_* (Section 7's Embedding 1<->2 pair,
+#                            via the same gemini_embed_content wrapper --
+#                            see graph.ts). No separate credential needed
+#                            for the graph layer.
 #   QSTASH_TOKEN          -- QStash's OWN bearer token (QStash tab at
 #                            https://console.upstash.com), NOT the same
 #                            credential as UPSTASH_EMAIL/UPSTASH_API_KEY
@@ -108,7 +124,8 @@ class_name = "CodeCellWorkflow"
 #                            different API, this publishes/schedules
 #                            messages via qstash.upstash.io. Powers qstash_*
 #                            AND CodeCellWorkflow's fast-worker-dispatch
-#                            step (Section 4f).
+#                            step (Section 4f) AND Section 7d/7f's graph
+#                            backfill/keepalive schedules.
 #   QSTASH_URL            -- optional, defaults to https://qstash.upstash.io.
 #                            REQUIRED if your Upstash account is
 #                            region-provisioned (e.g. EU) rather than the
@@ -121,6 +138,16 @@ class_name = "CodeCellWorkflow"
 #                            it here verbatim (e.g.
 #                            "https://qstash-eu-central-1.upstash.io", no
 #                            trailing /v2 -- that's added automatically).
+#   GRAPH_CRON_TOKEN      -- a random secret (e.g. `openssl rand -hex 32`),
+#                            checked on POST /webhook/graph-embedding-backfill
+#                            and POST /webhook/graph-heartbeat (Section 7d,
+#                            7f). Deliberately separate from every other
+#                            callback token in this file -- nothing
+#                            external needs to know this value, it's only
+#                            ever forwarded by this project's own QStash
+#                            schedules via Upstash-Forward-Authorization
+#                            (same mechanism FAST_WORKER_CALLBACK_TOKEN
+#                            uses -- see auth.ts and qstash.ts).
 #
 # --- CodeCellWorkflow-specific (code_cell_workflow.ts) ---------------------
 #   HEAVY_WORKER_REPO         -- "owner/name" of the repo containing
@@ -186,10 +213,10 @@ class_name = "CodeCellWorkflow"
 #                                Set this only if artifacts should live in a
 #                                separate repo from the Worker's source --
 #                                see github_release.ts.
-#   B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT -- not yet
-#                                added. Reserved for the Backblaze B2 half of
-#                                Section 9 (b2_* tools, b2.ts) -- arbitrary
-#                                keys, frequent writes, prefix listing,
-#                                per-object deletes. No wrangler binding
-#                                needed (plain authenticated HTTP out, same
-#                                shape as UPSTASH_*/GROQ_API_KEY above).
+#   B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT -- Backblaze
+#                                B2 S3-compatible credentials for the b2_*
+#                                tools (b2.ts) -- arbitrary keys, frequent
+#                                writes, prefix listing, per-object deletes.
+#                                No wrangler binding needed (plain
+#                                authenticated HTTP out, same shape as
+#                                UPSTASH_*/GROQ_API_KEY above).
