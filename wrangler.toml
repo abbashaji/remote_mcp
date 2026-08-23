@@ -173,3 +173,23 @@ class_name = "CodeCellWorkflow"
 #                                how many fast-worker-generate calls can
 #                                be in flight at once across every
 #                                instance.
+#
+# --- Object storage (Section 9, revised: GitHub Releases + Backblaze B2) ---
+#   GITHUB_RELEASE_ARTIFACTS_REPO -- optional PLAINTEXT var (fine to add to
+#                                [vars] above instead of a secret), defaults
+#                                to "abbashaji/remote_mcp" (this Worker's own
+#                                source repo) if unset. "owner/name" of the
+#                                repo the github_release_* tools write to --
+#                                all assets accumulate under one rolling
+#                                release (tag "v0-artifacts") on this repo.
+#                                Reuses GITHUB_TOKEN above; no new credential.
+#                                Set this only if artifacts should live in a
+#                                separate repo from the Worker's source --
+#                                see github_release.ts.
+#   B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT -- not yet
+#                                added. Reserved for the Backblaze B2 half of
+#                                Section 9 (b2_* tools, b2.ts) -- arbitrary
+#                                keys, frequent writes, prefix listing,
+#                                per-object deletes. No wrangler binding
+#                                needed (plain authenticated HTTP out, same
+#                                shape as UPSTASH_*/GROQ_API_KEY above).
