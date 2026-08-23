@@ -8,6 +8,7 @@
 
 import { createClient, type Client } from "@libsql/client/web";
 import type { TursoEnv } from "./turso";
+import { b2PutObject, bytesToBase64, type B2Env } from "./b2";
 
 // Re-resolves its own client rather than importing turso.ts's private
 // cachedClient -- cheap (fetch-based, no socket), and keeps this module
@@ -61,6 +62,28 @@ export async function ensureSchema(env: TursoEnv): Promise<void> {
     ],
     "write",
   );
+  // Idempotent column additions for the optional B2 artifact-routing
+  // integration below -- a plain CREATE TABLE IF NOT EXISTS above won't
+  // add columns to a `checkpoints` table that already existed before
+  // this feature shipped, so these run as their own best-effort
+  // ALTER TABLEs, swallowing "column already exists" specifically.
+  await ensureArtifactColumns(client);
+}
+
+async function ensureArtifactColumns(client: Client): Promise<void> {
+  const alters = [
+    `ALTER TABLE checkpoints ADD COLUMN artifact_provider TEXT NOT NULL DEFAULT 'inline'`,
+    `ALTER TABLE checkpoints ADD COLUMN artifact_key TEXT`,
+  ];
+  for (const sql of alters) {
+    try {
+      await client.execute(sql);
+    } catch (e) {
+      // SQLite/libSQL's error text for a column that's already there --
+      // anything else is a real problem and should surface.
+      if (!String(e).toLowerCase().includes("duplicate column")) throw e;
+    }
+  }
 }
 
 export interface CellRow {
@@ -126,10 +149,32 @@ export async function resumeCandidate(env: TursoEnv): Promise<CellRow | null> {
   return (rs.rows[0] as unknown as CellRow) ?? null;
 }
 
+// Section 9's "if genuinely unsure, default to B2" rule, applied here:
+// a checkpoint artifact bigger than this is routed to B2 rather than
+// stored inline in the `checkpoints.artifact` TEXT column. 4KB is well
+// under any Turso row-size concern -- this is about keeping checkpoint
+// rows small and queryable, not working around a hard limit.
+const ARTIFACT_B2_THRESHOLD_BYTES = 4096;
+
+function b2Configured(env: Partial<B2Env>): boolean {
+  return !!(env.B2_KEY_ID && env.B2_APPLICATION_KEY && env.B2_BUCKET_NAME && env.B2_ENDPOINT);
+}
+
 // Section 5c: a checkpoint without a real rationale is worse than no
 // checkpoint -- it looks resumable but tells the next session nothing.
+//
+// Section 9 integration (optional scope from the cell prompt): a large
+// `artifact` payload is routed to B2 by default rather than stored
+// inline, per the "if genuinely unsure, default to B2" rule -- Turso
+// keeps state ABOUT the artifact (artifact_provider/artifact_key),
+// never a second copy of the bytes. B2 routing is attempted only when
+// B2 is actually configured on this Worker, and any failure (missing
+// config, a failed upload) falls back to inline storage rather than
+// blocking the checkpoint write -- same "storage-routing failure never
+// blocks the write" discipline Section 7d already applies to graph.ts's
+// embedding calls.
 export async function writeCheckpoint(
-  env: TursoEnv,
+  env: TursoEnv & Partial<B2Env>,
   args: {
     cellId: number;
     phase: string;
@@ -143,9 +188,41 @@ export async function writeCheckpoint(
     throw new Error("rationale is required (min 10 chars) -- Section 5c");
   }
   const client = getWorkflowClient(env);
+  await ensureArtifactColumns(client);
+
+  let artifactProvider = "inline";
+  let artifactKey: string | null = null;
+  let artifactColumnValue = args.artifact ?? "";
+
+  if (args.artifact) {
+    const artifactBytes = new TextEncoder().encode(args.artifact);
+    if (artifactBytes.length > ARTIFACT_B2_THRESHOLD_BYTES && b2Configured(env)) {
+      const key = `checkpoints/cell-${args.cellId}/${args.sessionId}-${Date.now()}.txt`;
+      const result = await b2PutObject(env, key, bytesToBase64(artifactBytes), "text/plain");
+      if (result.startsWith("Error")) {
+        // Never let a B2 hiccup block the checkpoint write -- fall back
+        // to inline storage, same as if B2 had never been configured.
+        console.error(`B2 checkpoint-artifact routing failed for CodeCell #${args.cellId} (falling back to inline): ${result}`);
+      } else {
+        artifactProvider = "b2";
+        artifactKey = key;
+        artifactColumnValue = `[stored in B2: ${key}]`;
+      }
+    }
+  }
+
   await client.execute({
-    sql: `INSERT INTO checkpoints (cell_id, phase, session_id, artifact, next_action, decision_notes, draft_committed)
-          VALUES (?, ?, ?, ?, ?, ?, 1)`,
-    args: [args.cellId, args.phase, args.sessionId, args.artifact ?? "", args.nextAction ?? "", args.rationale],
+    sql: `INSERT INTO checkpoints (cell_id, phase, session_id, artifact, next_action, decision_notes, draft_committed, artifact_provider, artifact_key)
+          VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    args: [
+      args.cellId,
+      args.phase,
+      args.sessionId,
+      artifactColumnValue,
+      args.nextAction ?? "",
+      args.rationale,
+      artifactProvider,
+      artifactKey,
+    ],
   });
 }
