@@ -58,6 +58,8 @@ export interface Env {
   GROQ_API_KEY?: string;
   POSTHOG_API_KEY?: string;
   POSTHOG_MCP_URL?: string;
+  POSTHOG_PROJECT_API_KEY?: string; // Section 10: Capture API (event ingestion), NOT the same credential as POSTHOG_API_KEY above -- see posthog_events.ts
+  POSTHOG_INGEST_HOST?: string; // optional, e.g. "https://eu.i.posthog.com" for EU-region accounts -- defaults to the US Capture endpoint, see posthog_events.ts
   DISCORD_BOT_TOKEN?: string;
   GEMINI_API_KEY?: string;
   QSTASH_TOKEN?: string;
