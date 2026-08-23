@@ -108,6 +108,27 @@ class_name = "CodeCellWorkflow"
 #   POSTHOG_MCP_URL       -- optional, defaults to https://mcp.posthog.com/mcp
 #                            (US region). Set to https://mcp-eu.posthog.com/mcp
 #                            for EU-region PostHog accounts.
+#   POSTHOG_PROJECT_API_KEY -- Section 10/10a: PostHog PROJECT API key, for
+#                            EVENT INGESTION (posting new failure/resolution
+#                            events INTO PostHog via posthog_events.ts's
+#                            direct call to PostHog's Capture API). This is
+#                            a DIFFERENT credential from POSTHOG_API_KEY
+#                            above -- POSTHOG_API_KEY is a Personal API key
+#                            (bearer token) used only to QUERY/MANAGE
+#                            PostHog via its MCP server (posthog.ts); this
+#                            is a write-only Project API key used only to
+#                            SEND events. Create it at PostHog -> Project
+#                            Settings -> Project API Key (NOT Personal API
+#                            keys, which is where POSTHOG_API_KEY comes
+#                            from). Do not conflate the two -- each only
+#                            works for its own surface.
+#   POSTHOG_INGEST_HOST    -- optional, defaults to https://us.i.posthog.com
+#                            (US region). Set to https://eu.i.posthog.com
+#                            for EU-region PostHog accounts. Deliberately a
+#                            SEPARATE var from POSTHOG_MCP_URL above -- same
+#                            region concept, different API surface
+#                            (ingestion vs. MCP proxy), so one override
+#                            doesn't silently move the other.
 #   GEMINI_API_KEY        -- from https://aistudio.google.com/apikey. Powers
 #                            gemini_* (Fast Worker fallback tiers, Gemma 4
 #                            tagging, response_schema, google_search
