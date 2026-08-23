@@ -52,26 +52,6 @@ binding = "CODE_CELL_WORKFLOW"
 name = "turso-github-mcp-code-cell-workflow"
 class_name = "CodeCellWorkflow"
 
-# ARTIFACTS (r2.ts): Section 9's durable blob store -- for anything too
-# large or too binary for a Turso row (build artifacts, screenshots,
-# scraped HTML), NOT ephemeral single-call model-input staging (that's
-# Gemini's own File Storage API instead, Section 9a). Native R2 binding,
-# not the S3-compatible REST API -- gives env.ARTIFACTS.put/get/delete/
-# list directly, same "let the platform's own binding do the auth" choice
-# already made for KV/Workflows/Durable Objects above. Driven via the
-# r2_* MCP tools. The bucket must already exist before `wrangler deploy`
-# will succeed with this binding -- create it once with:
-#
-#   npx wrangler r2 bucket create ondine-artifacts
-#
-# Non-overlap rule (same shape as Section 7b): R2 owns bytes, Turso owns
-# state about those bytes -- e.g. checkpoint_write (index.ts/codecells.ts)
-# stores an "r2:<key>" reference in the checkpoint row's `artifact` column
-# rather than the raw bytes, once that artifact is binary/oversized.
-[[r2_buckets]]
-binding = "ARTIFACTS"
-bucket_name = "ondine-artifacts"
-
 # Secrets (set with `wrangler secret put <n>`, never in this file or
 # in a committed .dev.vars):
 #   MCP_AUTH_TOKEN        -- password that gates the /authorize consent
@@ -95,12 +75,6 @@ bucket_name = "ondine-artifacts"
 #                            Account Settings:Read. This token effectively
 #                            becomes this connector's permission ceiling
 #                            for all of Cloudflare, so scope it narrowly.
-#                            NOTE: creating the R2 bucket above via
-#                            cloudflare_execute also needs this token to
-#                            carry an R2:Edit (or equivalent Workers R2
-#                            Storage:Edit) scope; without it, create the
-#                            bucket manually with the wrangler command
-#                            shown above instead.
 #   NEO4J_URI             -- e.g. "neo4j+s://xxxx.databases.neo4j.io" (Aura)
 #                            or "https://host:7474" (self-hosted). Talks to
 #                            the HTTP Query API, not Bolt.
