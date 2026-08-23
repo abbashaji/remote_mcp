@@ -10,6 +10,12 @@
 // instances with the Query API enabled (Neo4j 5.x+). Auth is HTTP Basic
 // (username/password), sent per-request -- there's no persistent
 // connection to cache, just a resolved base URL + credentials.
+//
+// runCypher/rowsToObjects are exported (not just used internally) so
+// graph.ts -- Section 7's application layer on top of this file, same
+// relationship codecells.ts has to turso.ts -- can issue its own
+// parameterized Cypher without duplicating the HTTP Query API plumbing
+// here.
 
 export interface Neo4jEnv {
   NEO4J_URI?: string; // e.g. "neo4j+s://xxxx.databases.neo4j.io" or "https://host:7474"
@@ -62,7 +68,7 @@ function resolveTarget(env: Neo4jEnv): Neo4jTarget {
   return { httpBase: deriveHttpBase(uri), username, password, database: env.NEO4J_DATABASE || "neo4j" };
 }
 
-async function runCypher(
+export async function runCypher(
   env: Neo4jEnv,
   statement: string,
   parameters: Record<string, unknown> = {},
@@ -86,7 +92,7 @@ async function runCypher(
   return { fields: body.data?.fields ?? [], rows: body.data?.values ?? [] };
 }
 
-function rowsToObjects(fields: string[], rows: unknown[][]): Record<string, unknown>[] {
+export function rowsToObjects(fields: string[], rows: unknown[][]): Record<string, unknown>[] {
   return rows.map((row) => Object.fromEntries(fields.map((f, i) => [f, row[i]])));
 }
 
