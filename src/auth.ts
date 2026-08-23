@@ -4,7 +4,9 @@
 // every request that isn't an already-authenticated call to /mcp. In
 // practice that's just GET/POST /authorize -- the human-in-the-loop
 // consent step of the OAuth dance -- plus a couple of machine-to-machine
-// webhook routes that resolve CodeCellWorkflow's durable waits.
+// webhook routes that resolve CodeCellWorkflow's durable waits, and (as
+// of Section 7) two more that back Neo4j's embedding-backfill and
+// keepalive QStash schedules.
 //
 // Since this server has exactly one user (you), "consent" is just:
 // prove you know MCP_AUTH_TOKEN. No accounts, no database of users --
@@ -14,6 +16,7 @@
 
 import type { Env } from "./index";
 import { generateCode, type FastWorkerEventPayload } from "./code_cell_workflow";
+import { backfillPendingEmbeddings, touchHeartbeat } from "./graph";
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -33,6 +36,22 @@ function page(body: string): Response {
     </style></head><body>${body}</body></html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } },
   );
+}
+
+// Section 7's two cron routes share one machine-to-machine secret
+// (GRAPH_CRON_TOKEN, deliberately separate from every other callback
+// token in this file -- same reasoning as FAST_WORKER_CALLBACK_TOKEN vs
+// HEAVY_WORKER_CALLBACK_TOKEN: nothing external needs to know this value,
+// it's only ever set here and forwarded by QStash's own schedule).
+function checkGraphCronAuth(request: Request, env: Env): Response | null {
+  if (!env.GRAPH_CRON_TOKEN) {
+    return new Response("Server misconfigured: GRAPH_CRON_TOKEN not set.", { status: 500 });
+  }
+  const auth = request.headers.get("Authorization") || "";
+  if (auth !== `Bearer ${env.GRAPH_CRON_TOKEN}`) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+  return null;
 }
 
 export const AuthHandler = {
@@ -141,6 +160,36 @@ export const AuthHandler = {
       }
     }
 
+    // Section 7d: scans for embedding_pending Neo4j nodes and retries the
+    // Gemini Embedding 1<->2 pair, clearing the flag on success. Wired to
+    // a low-frequency (every 15-30 min) QStash schedule -- see the
+    // deploy summary for the actual cron this project's instance uses.
+    if (url.pathname === "/webhook/graph-embedding-backfill" && request.method === "POST") {
+      const authError = checkGraphCronAuth(request, env);
+      if (authError) return authError;
+      try {
+        const result = await backfillPendingEmbeddings(env);
+        return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+      } catch (e) {
+        return new Response(`Error backfilling embeddings: ${e}`, { status: 500 });
+      }
+    }
+
+    // Section 7f: touches a dedicated _heartbeat node so a quiet month of
+    // real project work doesn't let the free AuraDB instance cross its
+    // 30-day inactivity window and get deleted outright. Wired to a
+    // weekly QStash schedule -- comfortably inside that 30-day margin.
+    if (url.pathname === "/webhook/graph-heartbeat" && request.method === "POST") {
+      const authError = checkGraphCronAuth(request, env);
+      if (authError) return authError;
+      try {
+        const result = await touchHeartbeat(env);
+        return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+      } catch (e) {
+        return new Response(`Error touching heartbeat: ${e}`, { status: 500 });
+      }
+    }
+
     if (url.pathname === "/authorize" && request.method === "GET") {
       if (!env.MCP_AUTH_TOKEN) {
         return new Response(
@@ -154,7 +203,7 @@ export const AuthHandler = {
 
       return page(`
         <h1>Authorize ${escapeHtml(clientName)}</h1>
-        <p class="meta">This grants access to your github_*/turso_*/cloudflare_*/workflow_*/runner_* MCP tools.</p>
+        <p class="meta">This grants access to your github_*/turso_*/neo4j_*/graph_*/cloudflare_*/workflow_*/runner_* MCP tools.</p>
         <form method="POST" action="/authorize">
           <input type="hidden" name="oauth_req" value='${escapeHtml(JSON.stringify(oauthReqInfo))}'>
           <input type="password" name="password" placeholder="Server password" autofocus required>
