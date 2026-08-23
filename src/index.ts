@@ -20,6 +20,7 @@ import * as gh from "./github";
 import * as ghr from "./github_release";
 import * as turso from "./turso";
 import * as neo4j from "./neo4j";
+import * as graph from "./graph";
 import * as cf from "./cloudflare";
 import * as us from "./upstash";
 import * as groq from "./groq";
@@ -71,6 +72,7 @@ export interface Env {
   FAST_WORKER_RATE_PER_MINUTE?: string; // optional, defaults to "20" -- see code_cell_workflow.ts
   FAST_WORKER_PARALLELISM?: string; // optional -- see code_cell_workflow.ts
   GITHUB_RELEASE_ARTIFACTS_REPO?: string; // optional, defaults to "abbashaji/remote_mcp" -- see github_release.ts
+  GRAPH_CRON_TOKEN?: string; // machine-to-machine secret for /webhook/graph-embedding-backfill and /webhook/graph-heartbeat (Section 7d, 7f)
 }
 
 function text(s: string) {
@@ -101,6 +103,22 @@ function requireDiscordToken(env: Env): string {
 // to remote_mcp unless there's a reason not to" guidance.
 function defaultReleaseRepo(env: Env): string {
   return env.GITHUB_RELEASE_ARTIFACTS_REPO || "abbashaji/remote_mcp";
+}
+
+// Shared by every graph_* tool below that accepts inline relationships --
+// Section 7a's DEPENDS_ON/BLOCKS/IMPLEMENTS/AFFECTS, validated again
+// (defense in depth) inside graph.ts itself.
+const relationshipInputSchema = z.object({
+  type: z.enum(["DEPENDS_ON", "BLOCKS", "IMPLEMENTS", "AFFECTS"]),
+  direction: z.enum(["out", "in"]).default("out").describe("'out': (this node)-[type]->(target); 'in': (target)-[type]->(this node)"),
+  to_label: z.enum(["Decision", "Error", "Task", "CodeFile"]),
+  to_id: z.string().describe("id of the already-existing target node"),
+});
+
+function toRelationshipSpecs(
+  rels: { type: "DEPENDS_ON" | "BLOCKS" | "IMPLEMENTS" | "AFFECTS"; direction: "out" | "in"; to_label: graph.NodeLabel; to_id: string }[],
+): graph.RelationshipSpec[] {
+  return rels.map((r) => ({ type: r.type, direction: r.direction, toLabel: r.to_label, toId: r.to_id }));
 }
 
 function buildServer(env: Env): McpServer {
@@ -436,6 +454,232 @@ function buildServer(env: Env): McpServer {
     async ({ cypher, parameters }) => text(await neo4j.neo4jExecuteQuery(env, cypher, parameters)),
   );
 
+  // ---- graph_* (8 tools) ----------------------------------------------
+  // Section 7's application layer on top of neo4j_execute_query above
+  // (see graph.ts) -- Decision/Error/Task/CodeFile node writes with
+  // Gemini Embedding 1<->2 failover, the Orient retrieval step, the
+  // embedding-pending backfill, and the AuraDB keepalive heartbeat. A
+  // Context Slot loading the Architect/Reviewer role should reach for
+  // these instead of hand-writing raw Cypher through neo4j_execute_query.
+
+  server.registerTool(
+    "graph_write_decision",
+    {
+      description:
+        "Write a Decision node (Section 7a) -- a captured 'why', embedded via Gemini Embedding 1<->2 " +
+        "(Section 7d: embedding failure never blocks the write; embedding_pending=true is set instead). " +
+        "Optionally link it to existing nodes in the same call, e.g. BLOCKS a Task or DEPENDS_ON another " +
+        "Decision. This is the curation point Section 7g describes -- promoting a Turso checkpoint's " +
+        "rationale into the graph is a judgment call made here, never an automatic per-checkpoint write.",
+      inputSchema: {
+        title: z.string(),
+        rationale: z.string().min(10).describe("the captured 'why' -- required, min 10 chars"),
+        role: z.string().optional().describe('e.g. "Architect", "Reviewer"'),
+        cell_id: z.number().int().optional().describe("Turso code_cells.id this decision relates to, if any (Section 7b reference link)"),
+        id: z.string().optional().describe("explicit node id; omit to generate a UUID"),
+        relationships: z.array(relationshipInputSchema).default([]),
+      },
+    },
+    async ({ title, rationale, role, cell_id, id, relationships }) => {
+      try {
+        const result = await graph.writeDecisionNode(env, {
+          id,
+          title,
+          rationale,
+          role,
+          cellId: cell_id,
+          relationships: toRelationshipSpecs(relationships),
+        });
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error writing Decision node: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_write_error",
+    {
+      description:
+        "Write an Error node (Section 7a), embedded via Gemini Embedding 1<->2 with the same " +
+        "never-block-the-write failure handling as graph_write_decision (Section 7d).",
+      inputSchema: {
+        message: z.string(),
+        context: z.string().optional().describe("additional detail (traceback, surrounding circumstances) to embed alongside the message"),
+        cell_id: z.number().int().optional().describe("Turso code_cells.id this error relates to, if any"),
+        id: z.string().optional(),
+        relationships: z.array(relationshipInputSchema).default([]),
+      },
+    },
+    async ({ message, context, cell_id, id, relationships }) => {
+      try {
+        const result = await graph.writeErrorNode(env, {
+          id,
+          message,
+          context,
+          cellId: cell_id,
+          relationships: toRelationshipSpecs(relationships),
+        });
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error writing Error node: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_write_task",
+    {
+      description:
+        "Write a Task node (Section 7b) -- structural, not content, so it's never embedded. `status`, if " +
+        "set, is denormalized graph-traversal context ONLY; Turso's status column on code_cells remains " +
+        "the only thing orchestration logic actually reads. `cell_id` is the reference-only link back to " +
+        "the authoritative Turso row.",
+      inputSchema: {
+        title: z.string(),
+        cell_id: z.number().int().optional().describe("Turso code_cells.id this Task corresponds to"),
+        status: z.string().optional().describe("DENORMALIZED CONTEXT ONLY -- see description"),
+        id: z.string().optional(),
+        relationships: z.array(relationshipInputSchema).default([]),
+      },
+    },
+    async ({ title, cell_id, status, id, relationships }) => {
+      try {
+        const result = await graph.writeTaskNode(env, {
+          id,
+          title,
+          cellId: cell_id,
+          status,
+          relationships: toRelationshipSpecs(relationships),
+        });
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error writing Task node: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_write_code_file",
+    {
+      description:
+        "Write a CodeFile node (Section 7a), embedding `description` via Gemini Embedding 1<->2 if " +
+        "provided. `media_ref` is an R2 object key for a related screenshot/video/audio clip (Section " +
+        "7a-i) stored as a plain reference property -- it is NOT itself embedded by this tool (multimodal " +
+        "embedding would need gemini_embed_content extended for inline media, which is out of scope here).",
+      inputSchema: {
+        path: z.string(),
+        description: z.string().optional(),
+        cell_id: z.number().int().optional(),
+        media_ref: z.string().optional().describe("R2 object key, e.g. \"screenshots/cell-42-ui.png\""),
+        id: z.string().optional(),
+        relationships: z.array(relationshipInputSchema).default([]),
+      },
+    },
+    async ({ path, description, cell_id, media_ref, id, relationships }) => {
+      try {
+        const result = await graph.writeCodeFileNode(env, {
+          id,
+          path,
+          description,
+          cellId: cell_id,
+          mediaRef: media_ref,
+          relationships: toRelationshipSpecs(relationships),
+        });
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error writing CodeFile node: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_write_relationship",
+    {
+      description:
+        "Link two already-existing nodes with a DEPENDS_ON/BLOCKS/IMPLEMENTS/AFFECTS relationship " +
+        "(Section 7a). Use the `relationships` array on graph_write_* instead when the target already " +
+        "exists and you're creating the source node in the same call.",
+      inputSchema: {
+        from_label: z.enum(["Decision", "Error", "Task", "CodeFile"]),
+        from_id: z.string(),
+        to_label: z.enum(["Decision", "Error", "Task", "CodeFile"]),
+        to_id: z.string(),
+        type: z.enum(["DEPENDS_ON", "BLOCKS", "IMPLEMENTS", "AFFECTS"]),
+        direction: z.enum(["out", "in"]).default("out"),
+      },
+    },
+    async ({ from_label, from_id, to_label, to_id, type, direction }) => {
+      try {
+        await graph.writeRelationshipStandalone(env, from_label, from_id, to_label, to_id, type, direction);
+        return text(`Created ${type} relationship between ${from_label} '${from_id}' and ${to_label} '${to_id}'.`);
+      } catch (e) {
+        return text(`Error writing relationship: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_orient",
+    {
+      description:
+        "Section 7c's Orient (retrieval) step: vector search across Decision/Error nodes conceptually " +
+        "related to `query`, then graph traversal from those hits to find what Tasks they BLOCK and what " +
+        "CodeFiles they touch (AFFECTS/IMPLEMENTS). Run this before an Architect/Reviewer session makes or " +
+        "reviews a decision -- fold the returned `narrative` lines into the session's prompt as prior state.",
+      inputSchema: {
+        query: z.string().describe("natural-language description of the current task, for semantic similarity search"),
+        limit: z.number().int().default(5).describe("max Decision/Error hits to return"),
+      },
+    },
+    async ({ query, limit }) => {
+      try {
+        const result = await graph.graphOrient(env, query, limit);
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error running Orient query: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_backfill_embeddings",
+    {
+      description:
+        "Section 7d's manual trigger for the embedding-pending backfill (the same logic the weekly-ish " +
+        "QStash schedule at /webhook/graph-embedding-backfill runs automatically) -- retries Embedding " +
+        "1<->2 for any node still missing a vector and clears embedding_pending on success.",
+      inputSchema: { limit: z.number().int().default(25) },
+    },
+    async ({ limit }) => {
+      try {
+        const result = await graph.backfillPendingEmbeddings(env, limit);
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error backfilling embeddings: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_heartbeat",
+    {
+      description:
+        "Section 7f's manual trigger for the AuraDB keepalive (the same logic the weekly QStash schedule " +
+        "at /webhook/graph-heartbeat runs automatically) -- touches a dedicated _heartbeat node so a quiet " +
+        "period doesn't let the free instance cross its 30-day inactivity window and get deleted.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const result = await graph.touchHeartbeat(env);
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error touching heartbeat: ${e}`);
+      }
+    },
+  );
+
   // ---- cloudflare_* (2 tools) --------------------------------------
   // Proxied through to Cloudflare's own remote MCP server. Between the
   // two of these, this connector gets read/write access to this Worker's
@@ -734,16 +978,23 @@ function buildServer(env: Env): McpServer {
     {
       description:
         "Create a recurring cron schedule via QStash -- e.g. Section 4a's backstop that sweeps stuck " +
-        "`Pending` cells every 10 minutes.",
+        "`Pending` cells every 10 minutes, or Section 7d/7f's Neo4j embedding-backfill/keepalive schedules.",
       inputSchema: {
         destination_url: z.string().describe("Full https URL QStash will POST to on each firing"),
         cron: z.string().describe('Cron expression, e.g. "*/10 * * * *" for every 10 minutes'),
         body: z.any().optional().describe("JSON body delivered on each firing"),
         retries: z.number().int().optional(),
+        extra_headers: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe(
+            'Extra headers sent on each firing, e.g. {"Upstash-Forward-Authorization": "Bearer <token>"} so QStash ' +
+              "forwards a bearer token (stripped of the Upstash-Forward- prefix) to the destination route.",
+          ),
       },
     },
-    async ({ destination_url, cron, body, retries }) =>
-      text(await qstash.qstashCreateSchedule(env, destination_url, cron, body, { retries })),
+    async ({ destination_url, cron, body, retries, extra_headers }) =>
+      text(await qstash.qstashCreateSchedule(env, destination_url, cron, body, { retries, extraHeaders: extra_headers })),
   );
 
   server.registerTool(
