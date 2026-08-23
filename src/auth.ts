@@ -2,21 +2,26 @@
 //
 // The "defaultHandler" for @cloudflare/workers-oauth-provider: handles
 // every request that isn't an already-authenticated call to /mcp. In
-// practice that's just GET/POST /authorize -- the human-in-the-loop
-// consent step of the OAuth dance -- plus a couple of machine-to-machine
-// webhook routes that resolve CodeCellWorkflow's durable waits, and (as
-// of Section 7) two more that back Neo4j's embedding-backfill and
-// keepalive QStash schedules.
+// practice that's GET/POST /authorize -- the human-in-the-loop consent
+// step of the OAuth dance -- a couple of machine-to-machine webhook
+// routes that resolve CodeCellWorkflow's durable waits, two more that
+// back Neo4j's embedding-backfill and keepalive QStash schedules
+// (Section 7), and (Section 12) the operator dashboard's three routes.
 //
 // Since this server has exactly one user (you), "consent" is just:
 // prove you know MCP_AUTH_TOKEN. No accounts, no database of users --
 // the library's OAuthProvider handles all client registration (DCR),
 // code exchange, and access-token issuance/verification on its own,
-// backed by the OAUTH_KV namespace.
+// backed by the OAUTH_KV namespace. Section 12's dashboard reuses this
+// SAME secret directly (see dashboard.ts's checkDashboardAuth) rather
+// than running its own auth system -- the point from the spec is
+// reusing the credential, not replicating the OAuth dance for a single
+// HTML page.
 
 import type { Env } from "./index";
 import { generateCode, type FastWorkerEventPayload } from "./code_cell_workflow";
 import { backfillPendingEmbeddings, touchHeartbeat } from "./graph";
+import { handleDashboardData, handleDashboardPage, handleDashboardWs } from "./dashboard";
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -60,6 +65,22 @@ export const AuthHandler = {
 
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response("turso-github-mcp: ok\n", { status: 200 });
+    }
+
+    // Section 12: the operator dashboard. Three routes, all gated by the
+    // same MCP_AUTH_TOKEN /authorize already checks (see dashboard.ts's
+    // checkDashboardAuth for the exact mechanism -- ?token=, Bearer, or
+    // Basic auth). Checked ahead of the OAuth/webhook routes below since
+    // none of those paths overlap, but kept grouped here so the whole
+    // dashboard surface reads as one block.
+    if (url.pathname === "/dashboard" && request.method === "GET") {
+      return handleDashboardPage(request, env);
+    }
+    if (url.pathname === "/dashboard/data" && request.method === "GET") {
+      return handleDashboardData(request, env);
+    }
+    if (url.pathname === "/dashboard/ws") {
+      return handleDashboardWs(request, env);
     }
 
     // Section 4f's QStash pacing layer. CodeCellWorkflow's
