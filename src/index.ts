@@ -17,6 +17,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
 import * as gh from "./github";
+import * as ghr from "./github_release";
 import * as turso from "./turso";
 import * as neo4j from "./neo4j";
 import * as cf from "./cloudflare";
@@ -69,6 +70,7 @@ export interface Env {
   FAST_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /qstash/fast-worker-generate
   FAST_WORKER_RATE_PER_MINUTE?: string; // optional, defaults to "20" -- see code_cell_workflow.ts
   FAST_WORKER_PARALLELISM?: string; // optional -- see code_cell_workflow.ts
+  GITHUB_RELEASE_ARTIFACTS_REPO?: string; // optional, defaults to "abbashaji/remote_mcp" -- see github_release.ts
 }
 
 function text(s: string) {
@@ -91,6 +93,14 @@ function requireDiscordToken(env: Env): string {
     );
   }
   return env.DISCORD_BOT_TOKEN;
+}
+
+// Default artifacts repo for github_release_* tools -- same repo as the
+// Worker's own source (abbashaji/remote_mcp) unless overridden by the
+// optional GITHUB_RELEASE_ARTIFACTS_REPO var, per Section 9's "default
+// to remote_mcp unless there's a reason not to" guidance.
+function defaultReleaseRepo(env: Env): string {
+  return env.GITHUB_RELEASE_ARTIFACTS_REPO || "abbashaji/remote_mcp";
 }
 
 function buildServer(env: Env): McpServer {
@@ -211,6 +221,83 @@ function buildServer(env: Env): McpServer {
     },
     async ({ model, messages, temperature, max_tokens }) =>
       text(await gh.githubModelsChatCompletion(requireGithubToken(env), model, messages, { temperature, maxTokens: max_tokens })),
+  );
+
+  // ---- github_release_* (4 tools) ------------------------------------
+  // Section 9 (revised): GitHub Releases half of the object-storage
+  // split -- versioned deliverables (a CodeCell's final build once it
+  // reaches Completed, a packaged artifact a Reviewer might download),
+  // NOT high-frequency or prefix-listed writes (that's b2_* below).
+  // All assets accumulate under one rolling release (tag v0-artifacts)
+  // on `repo` (defaults to this Worker's own source repo, overridable
+  // via GITHUB_RELEASE_ARTIFACTS_REPO). Reuses GITHUB_TOKEN -- see
+  // github_release.ts.
+
+  server.registerTool(
+    "github_release_put_asset",
+    {
+      description:
+        "Upload (or overwrite, by name) an asset to the rolling 'v0-artifacts' release -- Section 9's " +
+        "GitHub-Releases half of object storage, for versioned build deliverables rather than " +
+        "high-frequency/prefix-listed blobs (use b2_put_object for those). `content_base64` is the " +
+        "asset's bytes, base64-encoded at the tool boundary. Returns the asset id and public download URL.",
+      inputSchema: {
+        asset_name: z.string().describe("Unique file name for this asset within the release, e.g. 'cell-42-build.zip'"),
+        content_base64: z.string().describe("Base64-encoded bytes of the asset."),
+        content_type: z.string().default("application/octet-stream").describe('e.g. "application/zip", "text/plain"'),
+        repo: z.string().optional().describe("\"owner/name\"; defaults to this Worker's own source repo"),
+      },
+    },
+    async ({ asset_name, content_base64, content_type, repo }) =>
+      text(
+        await ghr.githubReleasePutAsset(
+          requireGithubToken(env),
+          repo || defaultReleaseRepo(env),
+          asset_name,
+          content_base64,
+          content_type,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "github_release_get_asset",
+    {
+      description:
+        "Fetch one asset from the rolling 'v0-artifacts' release by id. Returns a JSON string with " +
+        "name/size/content_type/download_url plus base64-encoded content_base64 bytes.",
+      inputSchema: {
+        asset_id: z.number().int(),
+        repo: z.string().optional().describe("\"owner/name\"; defaults to this Worker's own source repo"),
+      },
+    },
+    async ({ asset_id, repo }) =>
+      text(await ghr.githubReleaseGetAsset(requireGithubToken(env), repo || defaultReleaseRepo(env), asset_id)),
+  );
+
+  server.registerTool(
+    "github_release_list_assets",
+    {
+      description: "List all assets currently on the rolling 'v0-artifacts' release.",
+      inputSchema: {
+        repo: z.string().optional().describe("\"owner/name\"; defaults to this Worker's own source repo"),
+      },
+    },
+    async ({ repo }) =>
+      text(await ghr.githubReleaseListAssets(requireGithubToken(env), repo || defaultReleaseRepo(env))),
+  );
+
+  server.registerTool(
+    "github_release_delete_asset",
+    {
+      description: "Delete one asset from the rolling 'v0-artifacts' release by id.",
+      inputSchema: {
+        asset_id: z.number().int(),
+        repo: z.string().optional().describe("\"owner/name\"; defaults to this Worker's own source repo"),
+      },
+    },
+    async ({ asset_id, repo }) =>
+      text(await ghr.githubReleaseDeleteAsset(requireGithubToken(env), repo || defaultReleaseRepo(env), asset_id)),
   );
 
   // ---- turso_* (7 tools) ------------------------------------------
