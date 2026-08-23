@@ -23,9 +23,10 @@
 // single-region (US-default) accounts need not set anything.
 //
 // This closes the gap the stack doc actually needs QStash for: Section
-// 4 step 3's "Traffic Control" (pacing calls to Fast Workers), and
-// Section 4a's dead-letter backstop cron (a QStash schedule that
-// re-fires every N minutes to sweep stuck `Pending` cells).
+// 4 step 3's "Traffic Control" (pacing calls to Fast Workers), Section
+// 4a's dead-letter backstop cron (a QStash schedule that re-fires every
+// N minutes to sweep stuck `Pending` cells), and (Section 7d/7f) the
+// Neo4j embedding-backfill and keepalive schedules in auth.ts.
 //
 // Section 4f addendum: flow-control support. Cloudflare Workflows
 // durable-executes retry/persistence for a SINGLE CodeCell instance, but
@@ -157,16 +158,21 @@ export async function qstashPublish(
 
 // Create a recurring cron schedule -- this is Section 4a's low-frequency
 // backstop ("every 10 minutes, query Turso for stuck-Pending cells and
-// re-fire them").
+// re-fire them"), and also Section 7d/7f's embedding-backfill and
+// keepalive schedules. extraHeaders lets a caller attach e.g.
+// "Upstash-Forward-Authorization": "Bearer <token>" so QStash forwards a
+// bearer token (stripped of the Upstash-Forward- prefix) to the
+// destination route on every firing -- same mechanism auth.ts's
+// /qstash/fast-worker-generate route already relies on.
 export async function qstashCreateSchedule(
   env: QstashEnv,
   destinationUrl: string,
   cron: string,
   body?: unknown,
-  opts?: { retries?: number },
+  opts?: { retries?: number; extraHeaders?: Record<string, string> },
 ): Promise<string> {
   try {
-    const extraHeaders: Record<string, string> = { "Upstash-Cron": cron };
+    const extraHeaders: Record<string, string> = { "Upstash-Cron": cron, ...(opts?.extraHeaders ?? {}) };
     if (opts?.retries !== undefined) extraHeaders["Upstash-Retries"] = String(opts.retries);
     const raw = await qstashFetch(env, "POST", `/schedules/${destinationUrl}`, {
       body: body ?? {},
