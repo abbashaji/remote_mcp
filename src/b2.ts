@@ -19,7 +19,11 @@
 //
 // Same conventions as every other module here: every exported function
 // returns an error string (prefixed "Error ...") rather than throwing,
-// stateless (fresh fetch() per call).
+// stateless (fresh fetch() per call). EXCEPTION: b2GetBucketUsage below,
+// added for Section 12b's dashboard -- that caller needs a real
+// number/throw to compose into a health signal, not a formatted string,
+// so it follows codecells.ts/graph.ts's throw-on-failure convention
+// instead. See its own doc comment.
 //
 // New secrets (Worker, via `wrangler secret put`): B2_KEY_ID,
 // B2_APPLICATION_KEY, B2_BUCKET_NAME, B2_ENDPOINT (the region-specific
@@ -315,4 +319,45 @@ export async function b2DeleteObject(env: B2Env, key: string): Promise<string> {
   } catch (e) {
     return `Error deleting B2 object '${key}': ${e}`;
   }
+}
+
+export interface B2BucketUsage {
+  totalBytes: number;
+  objectCount: number;
+  truncated: boolean;
+}
+
+/**
+ * Sum object sizes across the bucket (first page, up to 1000 keys --
+ * ListObjectsV2's default page size) -- Section 12b's operator-dashboard
+ * object-storage headroom signal (dashboard_signals.ts) needs a real
+ * byte total to compare against the 10GB free-tier cap, not the
+ * human-readable one-line-per-object string b2ListObjects returns above.
+ *
+ * THROWS on failure (unlike every other function in this file) -- its
+ * one caller (dashboard_signals.ts) composes this into a HealthSignal
+ * and needs a real error to catch and render as a "critical"/error
+ * state, not a string it would have to sniff for an "Error " prefix.
+ * Same throw-on-failure convention codecells.ts/graph.ts already use for
+ * the same reason.
+ *
+ * Pagination caveat: ListObjectsV2's continuation-token flow isn't
+ * implemented here -- if the bucket holds more than one page, `truncated`
+ * is set and `totalBytes`/`objectCount` should be read as a LOWER BOUND,
+ * not an exact figure. A single-operator pipeline's artifact bucket is
+ * unlikely to cross 1000 objects before this is worth revisiting; if it
+ * ever does, the dashboard signal surfaces `truncated` explicitly rather
+ * than silently under-reporting usage as if it were exact.
+ */
+export async function b2GetBucketUsage(env: B2Env): Promise<B2BucketUsage> {
+  const query: Record<string, string> = { "list-type": "2" };
+  const resp = await b2SignedFetch(env, "GET", "", { query });
+  if (!resp.ok) {
+    throw new Error(`B2 List returned ${resp.status}: ${(await resp.text()).slice(0, 500)}`);
+  }
+  const xml = await resp.text();
+  const objects = parseListObjectsXml(xml);
+  const truncated = /<IsTruncated>\s*true\s*<\/IsTruncated>/i.test(xml);
+  const totalBytes = objects.reduce((sum, o) => sum + (o.size || 0), 0);
+  return { totalBytes, objectCount: objects.length, truncated };
 }
