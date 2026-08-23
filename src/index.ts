@@ -27,6 +27,7 @@ import * as dc from "./discord";
 import * as gemini from "./gemini";
 import * as qstash from "./qstash";
 import * as ag from "./antigravity";
+import * as r2 from "./r2";
 import { AuthHandler } from "./auth";
 import { JobWorkflow } from "./workflows";
 import { TaskRunner, type RunnerTask } from "./runner";
@@ -62,6 +63,7 @@ export interface Env {
   JOB_WORKFLOW: Workflow<import("./workflows").JobWorkflowParams>;
   RUNNER: DurableObjectNamespace<TaskRunner>;
   CODE_CELL_WORKFLOW: Workflow<import("./code_cell_workflow").CodeCellWorkflowParams>;
+  ARTIFACTS: R2Bucket; // Section 9 -- durable blob store, bound via [[r2_buckets]] in wrangler.toml; see r2.ts
   DISCORD_ALERT_CHANNEL_ID?: string;
   HEAVY_WORKER_REPO?: string; // "owner/name" -- repo containing .github/workflows/test.yml
   HEAVY_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /webhook/heavy-worker-result
@@ -842,6 +844,68 @@ function buildServer(env: Env): McpServer {
     },
   );
 
+  // ---- r2_* (4 tools) -----------------------------------------------
+  // Section 9/9a: durable blob storage for anything too large or too
+  // binary for a Turso row -- build artifacts, screenshots, scraped HTML.
+  // Backed by the native R2 binding (env.ARTIFACTS -- see [[r2_buckets]]
+  // in wrangler.toml), not the S3-compatible REST API. NOT for a file
+  // that's only ever going to be fed into a single Gemini call -- that's
+  // ephemeral model-input staging via the Gemini File Storage API
+  // instead (Section 9a); R2 is for anything that needs to outlive one
+  // call. Non-overlap rule (same shape as Section 7b): R2 owns bytes,
+  // Turso owns state about those bytes -- pass the resulting object key
+  // around (e.g. in a checkpoint row), not the payload -- see r2.ts.
+
+  server.registerTool(
+    "r2_put_object",
+    {
+      description:
+        "Write a blob to R2 and return its object key (Section 9). Text payloads go straight in; binary " +
+        "payloads should be base64-encoded first and sent with encoding='base64' (an MCP call can't carry " +
+        "raw bytes). Omit `key` to get an auto-generated one.",
+      inputSchema: {
+        key: z.string().optional().describe("Object key; auto-generated if omitted, e.g. 'checkpoints/cell-12/screenshot.png'"),
+        content: z.string().describe("The payload -- plain text, or base64 if encoding='base64'"),
+        encoding: z.enum(["text", "base64"]).default("text").describe("Set to 'base64' for binary payloads"),
+        content_type: z.string().optional().describe("MIME type to store as R2 object metadata, e.g. 'image/png'"),
+      },
+    },
+    async ({ key, content, encoding, content_type }) =>
+      text(await r2.r2PutObject(env, { key, content, encoding, content_type })),
+  );
+
+  server.registerTool(
+    "r2_get_object",
+    {
+      description:
+        "Read a blob back from R2 by key. Returns JSON with size/content_type/encoding plus `content` -- " +
+        "plain text, or base64 if the object was originally written with encoding='base64'.",
+      inputSchema: { key: z.string() },
+    },
+    async ({ key }) => text(await r2.r2GetObject(env, key)),
+  );
+
+  server.registerTool(
+    "r2_list_objects",
+    {
+      description: "List objects in the R2 bucket, optionally filtered by key prefix.",
+      inputSchema: {
+        prefix: z.string().optional().describe("Only list keys starting with this prefix"),
+        limit: z.number().int().default(100),
+      },
+    },
+    async ({ prefix, limit }) => text(await r2.r2ListObjects(env, prefix, limit)),
+  );
+
+  server.registerTool(
+    "r2_delete_object",
+    {
+      description: "Delete an object from R2 by key.",
+      inputSchema: { key: z.string() },
+    },
+    async ({ key }) => text(await r2.r2DeleteObject(env, key)),
+  );
+
   // ---- cell_* (3 tools) -------------------------------------------------
   // Section 4a/4f/5/5b/5c: the CodeCell pipeline. cell_create starts a
   // durable CodeCellWorkflow instance (fast-worker-generate ->
@@ -896,20 +960,55 @@ function buildServer(env: Env): McpServer {
     {
       description:
         "Write a checkpoint row for a CodeCell (Section 5c). `rationale` is required (min 10 chars) -- " +
-        "a checkpoint without a real 'why' looks resumable but tells the next session nothing.",
+        "a checkpoint without a real 'why' looks resumable but tells the next session nothing. Per " +
+        "Section 9, if `artifact` is binary (artifact_encoding='base64') or larger than ~32KB of text, " +
+        "it's written to R2 instead of the Turso row, which then stores an 'r2:<key>' reference -- same " +
+        "'pass IDs, not payloads' discipline the doc already applies to QStash.",
       inputSchema: {
         cell_id: z.number().int(),
         phase: z.string().describe("mirrors the CodeCell's status at write time"),
         session_id: z.string(),
         artifact: z.string().optional().describe("partial code/notes as they currently stand"),
+        artifact_encoding: z
+          .enum(["text", "base64"])
+          .default("text")
+          .describe("set to 'base64' if `artifact` is binary data (screenshot, build output, etc.)"),
         next_action: z.string().optional().describe("the exact next concrete step, not a vague summary"),
         rationale: z.string().min(10).describe("the 'why' that isn't recoverable from the artifact alone"),
       },
     },
-    async ({ cell_id, phase, session_id, artifact, next_action, rationale }) => {
+    async ({ cell_id, phase, session_id, artifact, artifact_encoding, next_action, rationale }) => {
       try {
-        await writeCheckpoint(env, { cellId: cell_id, phase, sessionId: session_id, artifact, nextAction: next_action, rationale });
-        return text(`Checkpoint written for CodeCell #${cell_id}.`);
+        // Section 9: anything binary, or too large for a comfortable Turso
+        // TEXT column, goes to R2 instead -- the checkpoint row stores only
+        // the resulting key ("r2:<key>"), never the raw artifact.
+        const OVERSIZED_TEXT_THRESHOLD = 32 * 1024; // judgment call, not spec-mandated -- generous headroom under Turso's practical row-size comfort zone
+        let storedArtifact = artifact;
+        let r2Key: string | null = null;
+
+        if (artifact !== undefined && (artifact_encoding === "base64" || artifact.length > OVERSIZED_TEXT_THRESHOLD)) {
+          const key = `checkpoints/cell-${cell_id}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+          const putResult = await r2.r2PutObject(env, { key, content: artifact, encoding: artifact_encoding });
+          if (putResult.startsWith("Error")) {
+            return text(`Error writing checkpoint: artifact R2 write failed -- ${putResult}`);
+          }
+          r2Key = key;
+          storedArtifact = `r2:${key}`;
+        }
+
+        await writeCheckpoint(env, {
+          cellId: cell_id,
+          phase,
+          sessionId: session_id,
+          artifact: storedArtifact,
+          nextAction: next_action,
+          rationale,
+        });
+
+        return text(
+          `Checkpoint written for CodeCell #${cell_id}.` +
+            (r2Key ? ` Artifact (${artifact_encoding}, ${artifact!.length} chars) stored in R2 at key '${r2Key}'.` : ""),
+        );
       } catch (e) {
         return text(`Error writing checkpoint: ${e}`);
       }
