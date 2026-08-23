@@ -9,7 +9,9 @@
 // use on /mcp. No manual Client ID/Secret entry required.
 //
 // The only thing you configure is one password (MCP_AUTH_TOKEN) that
-// gates the /authorize consent screen -- see auth.ts.
+// gates the /authorize consent screen -- see auth.ts. Section 12's
+// operator dashboard reuses this same password rather than adding a
+// second auth system -- see dashboard.ts.
 
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -34,12 +36,13 @@ import { AuthHandler } from "./auth";
 import { JobWorkflow } from "./workflows";
 import { TaskRunner, type RunnerTask } from "./runner";
 import { CodeCellWorkflow } from "./code_cell_workflow";
+import { DashboardHub } from "./dashboard_do";
 import { ensureSchema, createCell, resumeCandidate, writeCheckpoint, getCell } from "./codecells";
 
 // Re-export the Workflow/Durable Object classes so wrangler can find them
 // as binding targets (see [[workflows]] / [[durable_objects.bindings]] +
 // [[migrations]] in wrangler.toml).
-export { JobWorkflow, TaskRunner, CodeCellWorkflow };
+export { JobWorkflow, TaskRunner, CodeCellWorkflow, DashboardHub };
 
 export interface Env {
   OAUTH_KV: KVNamespace;
@@ -67,6 +70,7 @@ export interface Env {
   JOB_WORKFLOW: Workflow<import("./workflows").JobWorkflowParams>;
   RUNNER: DurableObjectNamespace<TaskRunner>;
   CODE_CELL_WORKFLOW: Workflow<import("./code_cell_workflow").CodeCellWorkflowParams>;
+  DASHBOARD_HUB: DurableObjectNamespace<DashboardHub>; // Section 12c: operator-dashboard poll/broadcast DO -- see dashboard_do.ts
   DISCORD_ALERT_CHANNEL_ID?: string;
   HEAVY_WORKER_REPO?: string; // "owner/name" -- repo containing .github/workflows/test.yml
   HEAVY_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /webhook/heavy-worker-result
