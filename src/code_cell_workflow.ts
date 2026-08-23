@@ -34,6 +34,7 @@ import { githubTriggerWorkflow } from "./github";
 import { discordSendMessage } from "./discord";
 import { qstashPublish } from "./qstash";
 import { updateCell, getCell } from "./codecells";
+import { postHogCaptureException, postHogCaptureCodeCellResolution } from "./posthog_events";
 
 export interface CodeCellWorkflowParams {
   cell_id: number;
@@ -148,17 +149,69 @@ async function classifyFailure(env: Env, log: string): Promise<{ tag: "known_fla
 // Section 4 step 7/8: urgent tags (needs_human, dead_letter) alert
 // Discord immediately; known_flake_pattern is logged but left for a
 // batched digest (Section 3b) rather than paging anyone.
+//
+// Section 10 (third destination, wired here): the same call that would
+// otherwise only alert Discord now ALSO posts to PostHog's error-
+// tracking capture endpoint (posthog_events.ts), on every Failed/
+// Dead_Letter transition -- a strictly wider condition than Discord's
+// "urgent" (needs_human/dead_letter) gate, since Section 10 wants
+// known_flake_pattern failures in the trend data too even though they
+// don't page anyone. This is intentionally the ONLY new write added
+// here -- no new trigger logic, per Section 10's "same Worker call...
+// no new trigger logic, just an additional write alongside two that
+// already exist."
+//
+// Non-overlap rule (Section 10): PostHog is a read/trend surface only.
+// Nothing downstream of this call reads PostHog to decide pipeline
+// behavior -- Turso's `status` column (already updated by the caller
+// before notify() runs) remains the only source of truth orchestration
+// logic reads.
+//
+// Optional, not load-bearing (Section 10): a PostHog capture failure is
+// caught and logged here, never rethrown -- it must not fail this step
+// or block the Failed/Dead_Letter transition it's attached to. This is
+// why postHogCaptureException itself also never throws (returns an
+// error STRING, matching this project's convention) -- belt and
+// suspenders against a PostHog outage cascading into a Workflow step
+// failure.
 // ---------------------------------------------------------------------
-async function notify(env: Env, cellId: number, tag: string): Promise<void> {
-  const urgent = tag === "needs_human" || tag === "dead_letter";
-  if (urgent && env.DISCORD_BOT_TOKEN && env.DISCORD_ALERT_CHANNEL_ID) {
+async function notify(
+  env: Env,
+  cellId: number,
+  tag: string,
+  details?: { status?: string; lastError?: string; provider?: string },
+): Promise<void> {
+  const discordUrgent = tag === "needs_human" || tag === "dead_letter";
+  if (discordUrgent && env.DISCORD_BOT_TOKEN && env.DISCORD_ALERT_CHANNEL_ID) {
     await discordSendMessage(env.DISCORD_BOT_TOKEN, env.DISCORD_ALERT_CHANNEL_ID, `⚠️ CodeCell #${cellId} — \`${tag}\`, needs a look.`);
   }
-  // PostHog: intentionally not wired here yet. posthog.ts proxies
-  // PostHog's own remote MCP tool catalog (annotations/insights/error
-  // tracking), which needs a specific tool name confirmed via
-  // posthog_list_tools before this workflow calls it blind -- left as
-  // a follow-up rather than guessing a tool name that might not exist.
+
+  // PostHog: every Failed/Dead_Letter transition, not just the subset
+  // that pages Discord -- see the block comment above.
+  const isFailureTransition = tag !== "passed";
+  if (isFailureTransition) {
+    try {
+      const result = await postHogCaptureException(env, {
+        cellId,
+        tag,
+        status: details?.status ?? tag,
+        provider: details?.provider,
+        message: details?.lastError ?? `CodeCell #${cellId} reached '${tag}'.`,
+      });
+      if (result.startsWith("Error ")) {
+        console.error(`PostHog capture failed for CodeCell #${cellId} (non-blocking): ${result}`);
+      }
+    } catch (e) {
+      // Belt-and-suspenders: postHogCaptureException already catches
+      // internally and returns an error string rather than throwing,
+      // but this second layer guarantees a PostHog-side surprise (a
+      // bug in this file, a runtime exception the string-return
+      // convention didn't anticipate) still can't take down notify(),
+      // and therefore can't take down the Failed/Dead_Letter transition
+      // notify() is attached to.
+      console.error(`PostHog capture threw unexpectedly for CodeCell #${cellId} (non-blocking): ${e}`);
+    }
+  }
 }
 
 function requireWorkerUrl(env: Env): string {
@@ -262,8 +315,39 @@ export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowPa
 
       const tag = await step.do("tag-result", async () => {
         const result = testEvent.payload;
+
+        // Section 10a (approximation -- see this cell's summary and the
+        // header comment on postHogCaptureCodeCellResolution for the
+        // honest scope of what this is and isn't): posted once per
+        // CodeCell resolution, at CodeCell granularity rather than
+        // Section 3b's actual "cycle" (a batch of N cells a Reviewer/
+        // Architect session looks at together), since that batching
+        // concept doesn't exist as implemented infrastructure yet.
+        // `escalated` uses "resolved via automatic tagging alone
+        // (passed / known_flake_pattern) vs. needing a human
+        // (needs_human)" as the proxy for "no Context Slot involvement
+        // was needed." Wrapped and logged, never thrown -- same
+        // optional/non-load-bearing discipline as the exception capture
+        // in notify() below.
+        const captureResolution = async (resolutionTag: string, escalated: boolean) => {
+          try {
+            const r = await postHogCaptureCodeCellResolution(this.env, {
+              cellId: cell_id,
+              tag: resolutionTag,
+              escalated,
+              provider: draft.provider,
+            });
+            if (r.startsWith("Error ")) {
+              console.error(`PostHog resolution capture failed for CodeCell #${cell_id} (non-blocking): ${r}`);
+            }
+          } catch (e) {
+            console.error(`PostHog resolution capture threw unexpectedly for CodeCell #${cell_id} (non-blocking): ${e}`);
+          }
+        };
+
         if (result.passed) {
           await updateCell(this.env, cell_id, { status: "Completed", tag: "passed", last_error: null });
+          await captureResolution("passed", false);
           return "passed";
         }
 
@@ -277,11 +361,18 @@ export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowPa
           retry_count: nextRetries,
           last_error: `${classification.reason}\n\n${result.log}`.slice(0, 4000),
         });
-        return status === "Dead_Letter" ? "dead_letter" : classification.tag;
+        const finalTag = status === "Dead_Letter" ? "dead_letter" : classification.tag;
+        await captureResolution(finalTag, finalTag !== "known_flake_pattern");
+        return finalTag;
       });
 
       await step.do("notify", async () => {
-        await notify(this.env, cell_id, tag);
+        const cell = await getCell(this.env, cell_id);
+        await notify(this.env, cell_id, tag, {
+          status: cell?.status,
+          lastError: cell?.last_error ?? undefined,
+          provider: cell?.provider ?? draft.provider,
+        });
       });
     } catch (err: any) {
       // Terminal failure -- retry budget exhausted, the Fast Worker
@@ -290,8 +381,9 @@ export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowPa
       // the 30-minute timeout. Section 4a's Dead_Letter path, expressed
       // as this Workflow's own error handling.
       await step.do("dead-letter", async () => {
-        await updateCell(this.env, cell_id, { status: "Dead_Letter", last_error: String(err?.message ?? err).slice(0, 4000) });
-        await notify(this.env, cell_id, "dead_letter");
+        const message = String(err?.message ?? err).slice(0, 4000);
+        await updateCell(this.env, cell_id, { status: "Dead_Letter", last_error: message });
+        await notify(this.env, cell_id, "dead_letter", { status: "Dead_Letter", lastError: message });
       });
       throw err;
     }
