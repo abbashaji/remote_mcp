@@ -18,6 +18,7 @@ import { z } from "zod";
 
 import * as gh from "./github";
 import * as ghr from "./github_release";
+import * as b2 from "./b2";
 import * as turso from "./turso";
 import * as neo4j from "./neo4j";
 import * as graph from "./graph";
@@ -73,6 +74,10 @@ export interface Env {
   FAST_WORKER_PARALLELISM?: string; // optional -- see code_cell_workflow.ts
   GITHUB_RELEASE_ARTIFACTS_REPO?: string; // optional, defaults to "abbashaji/remote_mcp" -- see github_release.ts
   GRAPH_CRON_TOKEN?: string; // machine-to-machine secret for /webhook/graph-embedding-backfill and /webhook/graph-heartbeat (Section 7d, 7f)
+  B2_KEY_ID?: string; // Backblaze B2 S3-compatible application key id -- see b2.ts
+  B2_APPLICATION_KEY?: string; // Backblaze B2 S3-compatible application key secret -- see b2.ts
+  B2_BUCKET_NAME?: string; // Backblaze B2 bucket name -- see b2.ts
+  B2_ENDPOINT?: string; // Backblaze B2 bucket's S3-compatible endpoint, e.g. "s3.us-west-004.backblazeb2.com" -- see b2.ts
 }
 
 function text(s: string) {
@@ -316,6 +321,65 @@ function buildServer(env: Env): McpServer {
     },
     async ({ asset_id, repo }) =>
       text(await ghr.githubReleaseDeleteAsset(requireGithubToken(env), repo || defaultReleaseRepo(env), asset_id)),
+  );
+
+  // ---- b2_* (4 tools) --------------------------------------------------
+  // Section 9 (revised): Backblaze B2 half of the object-storage split --
+  // arbitrary keys, frequent/high-churn writes, prefix-based listing,
+  // per-object deletes (the job GitHub Releases above isn't shaped for).
+  // Per the cell prompt's "if genuinely unsure, default to B2" rule, this
+  // is the general-purpose bucket for intermediate artifacts that aren't
+  // yet "the deliverable." S3-compatible API, hand-signed with AWS SigV4
+  // -- see b2.ts. Needs B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME /
+  // B2_ENDPOINT configured as Worker secrets.
+
+  server.registerTool(
+    "b2_put_object",
+    {
+      description:
+        "Write a blob to Backblaze B2 under `key`, overwriting any existing object at that key -- " +
+        "Section 9's B2 half of object storage, for arbitrary-key/high-frequency/prefix-listed blobs " +
+        "(use github_release_put_asset instead for versioned build deliverables). `content_base64` is " +
+        "the blob's bytes, base64-encoded at the tool boundary.",
+      inputSchema: {
+        key: z.string().describe('Object key, e.g. "screenshots/cell-42-ui.png" or "runs/2026-08-23/log.txt"'),
+        content_base64: z.string().describe("Base64-encoded bytes of the blob."),
+        content_type: z.string().default("application/octet-stream").describe('e.g. "image/png", "text/plain"'),
+      },
+    },
+    async ({ key, content_base64, content_type }) =>
+      text(await b2.b2PutObject(env, key, content_base64, content_type)),
+  );
+
+  server.registerTool(
+    "b2_get_object",
+    {
+      description:
+        "Read a blob back from Backblaze B2 by key. Returns a JSON string with key/size/content_type " +
+        "plus base64-encoded content_base64 bytes.",
+      inputSchema: { key: z.string() },
+    },
+    async ({ key }) => text(await b2.b2GetObject(env, key)),
+  );
+
+  server.registerTool(
+    "b2_list_objects",
+    {
+      description: "List objects in the B2 bucket, optionally filtered by key prefix.",
+      inputSchema: {
+        prefix: z.string().optional().describe('e.g. "screenshots/" to list only objects under that prefix'),
+      },
+    },
+    async ({ prefix }) => text(await b2.b2ListObjects(env, prefix)),
+  );
+
+  server.registerTool(
+    "b2_delete_object",
+    {
+      description: "Delete an object from the B2 bucket by key.",
+      inputSchema: { key: z.string() },
+    },
+    async ({ key }) => text(await b2.b2DeleteObject(env, key)),
   );
 
   // ---- turso_* (7 tools) ------------------------------------------
@@ -1234,7 +1298,11 @@ function buildServer(env: Env): McpServer {
     {
       description:
         "Write a checkpoint row for a CodeCell (Section 5c). `rationale` is required (min 10 chars) -- " +
-        "a checkpoint without a real 'why' looks resumable but tells the next session nothing.",
+        "a checkpoint without a real 'why' looks resumable but tells the next session nothing. If " +
+        "`artifact` is large (>4KB), it's routed to Backblaze B2 by default (Section 9's 'when unsure, " +
+        "default to B2' rule) and the checkpoint row stores the provider + key instead of the raw text -- " +
+        "falls back to inline storage if B2 isn't configured or the upload fails, so this never blocks " +
+        "the checkpoint write.",
       inputSchema: {
         cell_id: z.number().int(),
         phase: z.string().describe("mirrors the CodeCell's status at write time"),
