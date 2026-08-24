@@ -12,9 +12,19 @@
 // doc Phase 2) -- a genuinely new table, not a repurposed one, flagged
 // here and in the Zero-Cost-Stack doc's Section 2 update for the same
 // "why does this table exist" trail the doc already keeps for 7e/7b.
+//
+// Note: @block65/webcrypto-web-push has no default export and no
+// sendWebPush() method -- it only exports buildPushPayload(), which
+// builds the encrypted request { headers, body } for a subscription.
+// Actually delivering it is a plain fetch() to the subscription's own
+// endpoint, which is what sendWebPushToAll() below does.
 
 import { createClient, type Client } from "@libsql/client/web";
-import webpush from "@block65/webcrypto-web-push";
+import {
+  buildPushPayload,
+  type PushSubscription as WebPushSubscription,
+  type VapidKeys,
+} from "@block65/webcrypto-web-push";
 import type { Env } from "./index";
 
 let cachedClient: Client | null = null;
@@ -69,7 +79,7 @@ export async function upsertPushSubscription(
   return id;
 }
 
-function requireVapid(env: Env): { subject: string; publicKey: string; privateKey: string } {
+function requireVapid(env: Env): VapidKeys {
   if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY || !env.VAPID_SUBJECT) {
     throw new Error(
       "VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT not fully configured on this Worker. Run: " +
@@ -77,7 +87,11 @@ function requireVapid(env: Env): { subject: string; publicKey: string; privateKe
         "(see web-push-migration-instructions.md Phase 1).",
     );
   }
-  return { subject: env.VAPID_SUBJECT, publicKey: env.VAPID_PUBLIC_KEY, privateKey: env.VAPID_PRIVATE_KEY };
+  return {
+    subject: env.VAPID_SUBJECT,
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+  };
 }
 
 // GET /vapid-public-key's handler reads this directly.
@@ -109,18 +123,27 @@ export async function sendWebPushToAll(
 
   await Promise.all(
     subs.map(async (sub) => {
+      const wpSub: WebPushSubscription = {
+        endpoint: sub.endpoint,
+        expirationTime: null,
+        keys: { p256dh: sub.p256dh, auth: sub.auth },
+      };
+
       try {
-        await webpush.sendWebPush(
-          JSON.stringify(payload),
-          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-          { subject: vapid.subject, publicKey: vapid.publicKey, privateKey: vapid.privateKey },
+        const { headers, body } = await buildPushPayload(
+          { data: JSON.stringify(payload) },
+          wpSub,
+          vapid,
         );
-      } catch (err: any) {
-        if (err?.statusCode === 404 || err?.statusCode === 410) {
+        const res = await fetch(sub.endpoint, { method: "POST", headers, body });
+
+        if (res.status === 404 || res.status === 410) {
           await client.execute({ sql: "DELETE FROM Push_Subscriptions WHERE id = ?", args: [sub.id] });
-        } else {
-          errors.push(`Push send failed for subscription ${sub.id}: ${err}`);
+        } else if (!res.ok) {
+          errors.push(`Push send failed for subscription ${sub.id}: ${res.status} ${res.statusText}`);
         }
+      } catch (err: any) {
+        errors.push(`Push send failed for subscription ${sub.id}: ${err}`);
       }
     }),
   );
