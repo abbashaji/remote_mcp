@@ -25,6 +25,31 @@
 // callback resolves a durable wait" pattern already used for
 // heavy-worker-result, just self-triggered by our own QStash publish
 // rather than an external GitHub Actions runner.
+//
+// Section 4g addendum: OpenHands (open-source, model-agnostic autonomous
+// coding agent) as a SECOND generation front-end, alongside the Fast
+// Worker cascade above -- not a patch layered on top of it, and not a
+// wholesale replacement of this file's own retry/tag/notify wiring.
+// Where this pipeline's own hand-built machinery is doing something
+// genuinely valuable (rate-limit-aware pacing across instances, the
+// deterministic Heavy Worker test as the actual pass/fail authority,
+// tagging/notify/checkpoint discipline, Section 3b's judgment boundary),
+// none of that changes. Where the JOB is "iterate on this code until it
+// works," OpenHands' own maintained plan->write->run->iterate loop is a
+// more capable version of what generateCode() does in one shot -- so it
+// slots in as an alternate front-end for THAT specific job only, then
+// hands off to the exact same Heavy Worker / tag-result / notify tail
+// every other cell already goes through. See runGenerateTestTagCycle()
+// below for the shared tail, and CodeCellWorkflow.run() for the two ways
+// into it: execution_mode='openhands' set at cell_create time, or a
+// 'pipeline' cell's first test failure auto-escalating to one OpenHands
+// attempt before falling to Failed/Debugger. Either way OpenHands never
+// decides a cell's status itself -- Heavy Worker's test result, run the
+// same way regardless of which front-end produced the code, still does
+// that. This is the same non-overlap discipline Section 4a already
+// applies to Antigravity's (currently unwired) fix-attempt concept and
+// Section 4c applies to tagging: a more capable tool gets to try, never
+// to self-certify.
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { Env } from "./index";
@@ -39,6 +64,7 @@ import { postHogCaptureException, postHogCaptureCodeCellResolution } from "./pos
 export interface CodeCellWorkflowParams {
   cell_id: number;
   spec: string;
+  execution_mode?: string; // 'pipeline' (default) | 'openhands' -- Section 4g
 }
 
 interface HeavyWorkerResult {
@@ -52,6 +78,13 @@ export interface FastWorkerDraft {
 }
 
 export type FastWorkerEventPayload = FastWorkerDraft | { error: string };
+
+// Section 4g: what /webhook/openhands-result (auth.ts) forwards. run_id
+// travels on both branches so it's captured even on a failed run (useful
+// for pulling logs afterward), not just a successful one.
+export type OpenHandsResultPayload =
+  | { code: string; run_id?: string }
+  | { error: string; run_id?: string };
 
 // ---------------------------------------------------------------------
 // Section 4b: Fast Worker cascade -- Groq primary, tiered Gemini/Gemma
@@ -146,6 +179,58 @@ async function classifyFailure(env: Env, log: string): Promise<{ tag: "known_fla
 }
 
 // ---------------------------------------------------------------------
+// Section 4/10: classify a Heavy Worker test result and record it --
+// Turso status/tag/retry_count, PostHog resolution capture. Extracted
+// as a standalone function (Section 4g) so BOTH the primary
+// generate-test cycle and an OpenHands escalation cycle can call the
+// exact same classification/recording logic rather than maintaining two
+// copies -- the provider that produced the code is the only thing that
+// varies between callers.
+// ---------------------------------------------------------------------
+async function classifyAndRecordResult(
+  env: Env,
+  cellId: number,
+  result: HeavyWorkerResult,
+  provider: string,
+): Promise<string> {
+  const captureResolution = async (resolutionTag: string, escalated: boolean) => {
+    try {
+      const r = await postHogCaptureCodeCellResolution(env, {
+        cellId,
+        tag: resolutionTag,
+        escalated,
+        provider,
+      });
+      if (r.startsWith("Error ")) {
+        console.error(`PostHog resolution capture failed for CodeCell #${cellId} (non-blocking): ${r}`);
+      }
+    } catch (e) {
+      console.error(`PostHog resolution capture threw unexpectedly for CodeCell #${cellId} (non-blocking): ${e}`);
+    }
+  };
+
+  if (result.passed) {
+    await updateCell(env, cellId, { status: "Completed", tag: "passed", last_error: null });
+    await captureResolution("passed", false);
+    return "passed";
+  }
+
+  const cell = await getCell(env, cellId);
+  const nextRetries = (cell?.retry_count ?? 0) + 1;
+  const classification = await classifyFailure(env, result.log);
+  const status = nextRetries > 3 ? "Dead_Letter" : "Failed";
+  await updateCell(env, cellId, {
+    status,
+    tag: classification.tag,
+    retry_count: nextRetries,
+    last_error: `${classification.reason}\n\n${result.log}`.slice(0, 4000),
+  });
+  const finalTag = status === "Dead_Letter" ? "dead_letter" : classification.tag;
+  await captureResolution(finalTag, finalTag !== "known_flake_pattern");
+  return finalTag;
+}
+
+// ---------------------------------------------------------------------
 // Section 4 step 7/8: urgent tags (needs_human, dead_letter) alert
 // Discord immediately; known_flake_pattern is logged but left for a
 // batched digest (Section 3b) rather than paging anyone.
@@ -218,8 +303,9 @@ function requireWorkerUrl(env: Env): string {
   if (!env.WORKER_URL) {
     throw new Error(
       "WORKER_URL is not configured on this Worker (needed so fast-worker-generate can publish a QStash " +
-        "message back to this same Worker's own /qstash/fast-worker-generate route). Set it in wrangler.toml's " +
-        "[vars] block to this Worker's own https://....workers.dev base URL.",
+        "message back to this same Worker's own /qstash/fast-worker-generate route, and so the OpenHands " +
+        "generation lane knows where to POST its result). Set it in wrangler.toml's [vars] block to this " +
+        "Worker's own https://....workers.dev base URL.",
     );
   }
   return env.WORKER_URL;
@@ -235,151 +321,220 @@ function requireFastWorkerCallbackToken(env: Env): string {
   return env.FAST_WORKER_CALLBACK_TOKEN;
 }
 
+// Section 4g: the repo containing .github/workflows/openhands-run.yml.
+// Deliberately falls back to HEAVY_WORKER_REPO rather than requiring a
+// separate secret in the common case -- both workflows want the same
+// "public repo, unmetered runners" property, and this project already
+// has exactly one such repo (abbashaji/ondine). Override with
+// OPENHANDS_REPO only if OpenHands' workflow file should live somewhere
+// else.
+function resolveOpenHandsRepo(env: Env): string {
+  const repo = env.OPENHANDS_REPO || env.HEAVY_WORKER_REPO;
+  if (!repo) {
+    throw new Error(
+      "Neither OPENHANDS_REPO nor HEAVY_WORKER_REPO is set on this Worker -- need a repo containing " +
+        ".github/workflows/openhands-run.yml.",
+    );
+  }
+  return repo;
+}
+
+// ---------------------------------------------------------------------
+// Section 4g: shared generate -> persist -> test -> tag cycle. Two
+// callers use this: the primary attempt (generator matches whatever
+// execution_mode the cell was created with) and, for a 'pipeline' cell
+// whose primary attempt's test failed, a single OpenHands escalation
+// attempt. `label` disambiguates step/event names between the two calls
+// on the same Workflow instance -- Cloudflare Workflows step identity is
+// per-name, and both calls can occur sequentially within one run() (see
+// below), so each needs its own step names even though the code path is
+// otherwise identical. `type` values passed to step.waitForEvent are
+// NOT suffixed -- they must match exactly what the external webhook
+// (auth.ts) always sends, regardless of which labeled step is currently
+// waiting; only one wait of a given type is ever active on an instance
+// at once in this design, so there's no ambiguity.
+// ---------------------------------------------------------------------
+async function runGenerateTestTagCycle(
+  env: Env,
+  step: WorkflowStep,
+  cellId: number,
+  spec: string,
+  instanceId: string,
+  generator: "pipeline" | "openhands",
+  label: "primary" | "escalation",
+): Promise<{ tag: string; provider: string }> {
+  let draft: FastWorkerDraft;
+
+  if (generator === "openhands") {
+    await step.do(`openhands-generate-dispatch-${label}`, async () => {
+      await updateCell(env, cellId, { status: "Processing_Drafting" });
+      const workerUrl = requireWorkerUrl(env);
+      const token = requireOpenHandsCallbackToken(env);
+      const repo = resolveOpenHandsRepo(env);
+
+      let task = spec;
+      if (label === "escalation") {
+        const cell = await getCell(env, cellId);
+        task =
+          `${spec}\n\nA previous automated attempt at this task produced code that failed its test run. ` +
+          `Failure context from that attempt:\n${(cell?.last_error ?? "(none captured)").slice(0, 2000)}\n\n` +
+          `Iterate past whatever that attempt got wrong.`;
+      }
+
+      const result = await githubTriggerWorkflow(env.GITHUB_TOKEN!, repo, "openhands-run.yml", "main", {
+        cell_id: String(cellId),
+        workflow_instance_id: instanceId,
+        task,
+        callback_url: `${workerUrl}/webhook/openhands-result`,
+      });
+      if (result.startsWith("Failed to trigger")) throw new Error(result);
+      // Deliberately no Authorization header/token passed as a workflow
+      // input above -- OPENHANDS_CALLBACK_TOKEN lives as a GitHub
+      // repo-level secret on the SAME repo (see openhands-run.yml),
+      // never transiting through this dispatch call's plaintext inputs.
+      void token;
+    });
+
+    const ohEvent = await step.waitForEvent<OpenHandsResultPayload>(`openhands-generate-wait-${label}`, {
+      type: "openhands-result",
+      timeout: "60 minutes",
+    });
+
+    await step.do(`record-openhands-run-${label}`, async () => {
+      await updateCell(env, cellId, {
+        openhands_run_id: ohEvent.payload.run_id ?? null,
+        openhands_result: "error" in ohEvent.payload ? `${label}_error` : `${label}_generated`,
+      });
+    });
+
+    if ("error" in ohEvent.payload) {
+      throw new Error(`OpenHands generation failed: ${ohEvent.payload.error}`);
+    }
+    draft = { code: ohEvent.payload.code, provider: "openhands" };
+  } else {
+    await step.do(`fast-worker-dispatch-${label}`, async () => {
+      const workerUrl = requireWorkerUrl(env);
+      const token = requireFastWorkerCallbackToken(env);
+      const rate = Number(env.FAST_WORKER_RATE_PER_MINUTE ?? "20");
+      const parallelismRaw = env.FAST_WORKER_PARALLELISM;
+      const result = await qstashPublish(
+        env,
+        `${workerUrl}/qstash/fast-worker-generate`,
+        { cell_id: cellId, spec, workflow_instance_id: instanceId },
+        {
+          retries: 2,
+          flowControl: {
+            key: "fast-worker-generate",
+            rate,
+            period: "1m",
+            parallelism: parallelismRaw ? Number(parallelismRaw) : undefined,
+          },
+          extraHeaders: { "Upstash-Forward-Authorization": `Bearer ${token}` },
+        },
+      );
+      if (result.startsWith("Error ")) throw new Error(result);
+      return result;
+    });
+
+    const fastWorkerEvent = await step.waitForEvent<FastWorkerEventPayload>(`fast-worker-wait-${label}`, {
+      type: "fast-worker-result",
+      timeout: "10 minutes",
+    });
+    if ("error" in fastWorkerEvent.payload) {
+      throw new Error(`Fast Worker dispatch failed: ${fastWorkerEvent.payload.error}`);
+    }
+    draft = fastWorkerEvent.payload;
+  }
+
+  await step.do(`persist-code-ready-${label}`, async () => {
+    await updateCell(env, cellId, { status: "Code_Ready", code: draft.code, provider: draft.provider });
+  });
+
+  await step.do(`heavy-worker-dispatch-${label}`, async () => {
+    await updateCell(env, cellId, { status: "Testing" });
+    const result = await githubTriggerWorkflow(env.GITHUB_TOKEN!, env.HEAVY_WORKER_REPO!, "test.yml", "main", {
+      cell_id: String(cellId),
+      workflow_instance_id: String(instanceId),
+    });
+    if (result.startsWith("Failed to trigger")) throw new Error(result);
+  });
+
+  // Durable wait: survives a Worker restart between dispatch and
+  // result, unlike a synchronous poll loop would. Resolved by
+  // /webhook/heavy-worker-result in auth.ts -- same route, same event
+  // type, regardless of which generator produced the code being tested.
+  const testEvent = await step.waitForEvent<HeavyWorkerResult>(`heavy-worker-wait-${label}`, {
+    type: "heavy-worker-result",
+    timeout: "30 minutes",
+  });
+
+  const tag = await step.do(`tag-result-${label}`, async () =>
+    classifyAndRecordResult(env, cellId, testEvent.payload, draft.provider),
+  );
+
+  return { tag, provider: draft.provider };
+}
+
+function requireOpenHandsCallbackToken(env: Env): string {
+  if (!env.OPENHANDS_CALLBACK_TOKEN) {
+    throw new Error(
+      "OPENHANDS_CALLBACK_TOKEN is not configured on this Worker. Run: wrangler secret put OPENHANDS_CALLBACK_TOKEN " +
+        "(a random secret, e.g. `openssl rand -hex 32`). Also set the SAME value as a repo secret named " +
+        "OPENHANDS_CALLBACK_TOKEN on whichever repo runs openhands-run.yml -- that job forwards it as a " +
+        "bearer token when it POSTs back to /webhook/openhands-result (auth.ts).",
+    );
+  }
+  return env.OPENHANDS_CALLBACK_TOKEN;
+}
+
 export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowParams> {
   async run(event: WorkflowEvent<CodeCellWorkflowParams>, step: WorkflowStep) {
-    const { cell_id, spec } = event.payload;
+    const { cell_id, spec, execution_mode } = event.payload;
     const instanceId = (event as any).instanceId as string;
+    const mode: "pipeline" | "openhands" = execution_mode === "openhands" ? "openhands" : "pipeline";
 
     try {
-      // Dispatch: publish to our own /qstash/fast-worker-generate route
-      // via QStash rather than calling generateCode() in-process. The
-      // Upstash-Flow-Control-Key is shared across every CodeCellWorkflow
-      // instance's dispatch, so QStash -- not this single instance -- is
-      // what enforces "don't burst past Groq/Gemini's actual RPM caps"
-      // when many cells go Pending at once (Section 4f's non-overlap
-      // rule; see Section 2's QStash row for the disputed Groq daily cap
-      // this is deliberately conservative against).
-      await step.do("fast-worker-dispatch", async () => {
-        const workerUrl = requireWorkerUrl(this.env);
-        const token = requireFastWorkerCallbackToken(this.env);
-        const rate = Number(this.env.FAST_WORKER_RATE_PER_MINUTE ?? "20");
-        const parallelismRaw = this.env.FAST_WORKER_PARALLELISM;
-        const result = await qstashPublish(
-          this.env,
-          `${workerUrl}/qstash/fast-worker-generate`,
-          { cell_id, spec, workflow_instance_id: instanceId },
-          {
-            retries: 2,
-            flowControl: {
-              key: "fast-worker-generate",
-              rate,
-              period: "1m",
-              parallelism: parallelismRaw ? Number(parallelismRaw) : undefined,
-            },
-            // QStash forwards any Upstash-Forward-* header to the
-            // destination with the prefix stripped -- this is how
-            // /qstash/fast-worker-generate authenticates the request as
-            // actually having come from our own paced publish, not an
-            // arbitrary POST to a guessable route.
-            extraHeaders: { "Upstash-Forward-Authorization": `Bearer ${token}` },
-          },
-        );
-        if (result.startsWith("Error ")) throw new Error(result);
-        return result;
-      });
+      let { tag } = await runGenerateTestTagCycle(this.env, step, cell_id, spec, instanceId, mode, "primary");
 
-      // Durable wait: /qstash/fast-worker-generate (auth.ts) runs the
-      // actual Groq -> Gemini cascade once QStash releases it per the
-      // flow-control key above, then resolves this via sendEvent --
-      // same "webhook resolves step.waitForEvent" shape as
-      // heavy-worker-result below, just for the Fast Worker leg.
-      const fastWorkerEvent = await step.waitForEvent<FastWorkerEventPayload>("fast-worker-result", {
-        type: "fast-worker-result",
-        timeout: "10 minutes",
-      });
-      if ("error" in fastWorkerEvent.payload) {
-        throw new Error(`Fast Worker dispatch failed: ${fastWorkerEvent.payload.error}`);
-      }
-      const draft: FastWorkerDraft = fastWorkerEvent.payload;
-
-      await step.do("persist-code-ready", async () => {
-        await updateCell(this.env, cell_id, { status: "Code_Ready", code: draft.code, provider: draft.provider });
-      });
-
-      await step.do("heavy-worker-dispatch", async () => {
-        await updateCell(this.env, cell_id, { status: "Testing" });
-        const result = await githubTriggerWorkflow(this.env.GITHUB_TOKEN!, this.env.HEAVY_WORKER_REPO!, "test.yml", "main", {
-          cell_id: String(cell_id),
-          workflow_instance_id: String(instanceId),
-        });
-        if (result.startsWith("Failed to trigger")) throw new Error(result);
-      });
-
-      // Durable wait: survives a Worker restart between dispatch and
-      // result, unlike a synchronous poll loop would. Resolved by
-      // /webhook/heavy-worker-result in auth.ts.
-      const testEvent = await step.waitForEvent<HeavyWorkerResult>("heavy-worker-result", {
-        type: "heavy-worker-result",
-        timeout: "30 minutes",
-      });
-
-      const tag = await step.do("tag-result", async () => {
-        const result = testEvent.payload;
-
-        // Section 10a (approximation -- see this cell's summary and the
-        // header comment on postHogCaptureCodeCellResolution for the
-        // honest scope of what this is and isn't): posted once per
-        // CodeCell resolution, at CodeCell granularity rather than
-        // Section 3b's actual "cycle" (a batch of N cells a Reviewer/
-        // Architect session looks at together), since that batching
-        // concept doesn't exist as implemented infrastructure yet.
-        // `escalated` uses "resolved via automatic tagging alone
-        // (passed / known_flake_pattern) vs. needing a human
-        // (needs_human)" as the proxy for "no Context Slot involvement
-        // was needed." Wrapped and logged, never thrown -- same
-        // optional/non-load-bearing discipline as the exception capture
-        // in notify() below.
-        const captureResolution = async (resolutionTag: string, escalated: boolean) => {
-          try {
-            const r = await postHogCaptureCodeCellResolution(this.env, {
-              cellId: cell_id,
-              tag: resolutionTag,
-              escalated,
-              provider: draft.provider,
-            });
-            if (r.startsWith("Error ")) {
-              console.error(`PostHog resolution capture failed for CodeCell #${cell_id} (non-blocking): ${r}`);
-            }
-          } catch (e) {
-            console.error(`PostHog resolution capture threw unexpectedly for CodeCell #${cell_id} (non-blocking): ${e}`);
-          }
-        };
-
-        if (result.passed) {
-          await updateCell(this.env, cell_id, { status: "Completed", tag: "passed", last_error: null });
-          await captureResolution("passed", false);
-          return "passed";
+      // Section 4g auto-escalation. Deliberately NOT a judgment call
+      // about whether this task "looks OpenHands-shaped" -- that kind of
+      // a-priori fit guess is exactly the sort of thing Section 3b keeps
+      // off Layer 0. This is a mechanical, outcome-triggered rule
+      // instead: a 'pipeline' cell whose primary attempt actually failed
+      // its test (not a malformed-spec Dead_Letter -- that's an
+      // Architect problem a longer autonomous loop can't fix either)
+      // gets exactly one OpenHands turn before settling to Failed and
+      // waiting for a Debugger, gated by openhands_attempted so it can
+      // never fire twice on the same cell.
+      if (mode === "pipeline" && tag !== "passed" && tag !== "dead_letter") {
+        const cell = await step.do("check-openhands-escalation-eligibility", async () => getCell(this.env, cell_id));
+        const eligible = !!cell && !cell.openhands_attempted && cell.status === "Failed";
+        if (eligible) {
+          await step.do("mark-openhands-attempted", async () => {
+            await updateCell(this.env, cell_id, { openhands_attempted: true });
+          });
+          const escalated = await runGenerateTestTagCycle(this.env, step, cell_id, spec, instanceId, "openhands", "escalation");
+          tag = escalated.tag;
         }
-
-        const cell = await getCell(this.env, cell_id);
-        const nextRetries = (cell?.retry_count ?? 0) + 1;
-        const classification = await classifyFailure(this.env, result.log);
-        const status = nextRetries > 3 ? "Dead_Letter" : "Failed";
-        await updateCell(this.env, cell_id, {
-          status,
-          tag: classification.tag,
-          retry_count: nextRetries,
-          last_error: `${classification.reason}\n\n${result.log}`.slice(0, 4000),
-        });
-        const finalTag = status === "Dead_Letter" ? "dead_letter" : classification.tag;
-        await captureResolution(finalTag, finalTag !== "known_flake_pattern");
-        return finalTag;
-      });
+      }
 
       await step.do("notify", async () => {
         const cell = await getCell(this.env, cell_id);
         await notify(this.env, cell_id, tag, {
           status: cell?.status,
           lastError: cell?.last_error ?? undefined,
-          provider: cell?.provider ?? draft.provider,
+          provider: cell?.provider ?? undefined,
         });
       });
     } catch (err: any) {
       // Terminal failure -- retry budget exhausted, the Fast Worker
       // dispatch itself failed (all providers exhausted, or QStash
-      // couldn't deliver), or the Heavy Worker never called back before
-      // the 30-minute timeout. Section 4a's Dead_Letter path, expressed
-      // as this Workflow's own error handling.
+      // couldn't deliver), the OpenHands generation lane errored or
+      // timed out, or the Heavy Worker never called back before the
+      // 30-minute timeout. Section 4a's Dead_Letter path, expressed as
+      // this Workflow's own error handling -- unchanged by Section 4g,
+      // since an OpenHands failure surfaces the same way any other
+      // generation-lane failure always has.
       await step.do("dead-letter", async () => {
         const message = String(err?.message ?? err).slice(0, 4000);
         await updateCell(this.env, cell_id, { status: "Dead_Letter", last_error: message });
