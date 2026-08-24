@@ -8,7 +8,7 @@
 // the dashboard already uses (Phase 3's "same Worker, same Bearer/
 // Cloudflare Access gate... do not stand up a separate auth path").
 //
-// Four routes (wired into AuthHandler.fetch in auth.ts):
+// Five routes (wired into AuthHandler.fetch in auth.ts):
 //   GET  /subscribe            -- the HTML page + inline JS that
 //                                  registers /sw.js, subscribes via
 //                                  pushManager, and POSTs the result to
@@ -18,6 +18,15 @@
 //   POST /subscribe/register   -- receives the browser's PushSubscription
 //                                  object and upserts it into Turso's
 //                                  Push_Subscriptions table (push.ts)
+//   POST /subscribe/test       -- sends a canned test notification to
+//                                  every currently-registered subscription
+//                                  via sendWebPushToAll (push.ts). Added
+//                                  purely to verify the end-to-end push
+//                                  path works after the
+//                                  @block65/webcrypto-web-push API fix --
+//                                  nothing in the real alert path
+//                                  (code_cell_workflow.ts) calls this;
+//                                  it's a manual verification route only.
 //   GET  /sw.js                -- the service worker itself, served at
 //                                  the root scope (not /subscribe/sw.js)
 //                                  so its push-event scope covers the
@@ -28,7 +37,7 @@
 
 import type { Env } from "./index";
 import { checkDashboardAuth } from "./dashboard";
-import { getVapidPublicKey, upsertPushSubscription } from "./push";
+import { getVapidPublicKey, upsertPushSubscription, sendWebPushToAll } from "./push";
 
 function unauthorized(): Response {
   return new Response(
@@ -64,6 +73,27 @@ export async function handleSubscribeRegister(request: Request, env: Env): Promi
       auth: body.keys.auth,
     });
     return new Response(JSON.stringify({ ok: true, id }), { headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+// Manual verification route -- not part of the real alert path. Sends a
+// canned notification to every registered subscription so you can
+// confirm buildPushPayload()+fetch() (push.ts) actually delivers, without
+// needing to force a CodeCell into Failed/Dead_Letter to exercise it.
+export async function handleSubscribeTest(request: Request, env: Env): Promise<Response> {
+  if (!checkDashboardAuth(request, env)) return unauthorized();
+  try {
+    await sendWebPushToAll(env, {
+      title: "Ondine test notification",
+      body: "If you see this, the Web Push path is working end to end.",
+      tag: "test",
+    });
+    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
   } catch (e) {
     return new Response(JSON.stringify({ ok: false, error: String(e) }), {
       status: 500,
