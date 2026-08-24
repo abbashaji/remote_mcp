@@ -1021,6 +1021,13 @@ function buildServer(env: Env): McpServer {
         delay_seconds: z.number().int().optional(),
         retries: z.number().int().optional(),
         callback_url: z.string().optional().describe("URL QStash calls back with the destination's response"),
+        extra_headers: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe(
+            'Extra headers sent with this publish, e.g. {"Upstash-Forward-Authorization": "Bearer <token>"} so QStash ' +
+              "forwards a bearer token (stripped of the Upstash-Forward- prefix) to the destination route.",
+          ),
         flow_control_key: z
           .string()
           .optional()
@@ -1030,12 +1037,13 @@ function buildServer(env: Env): McpServer {
         flow_control_period: z.string().optional().describe('e.g. "1m", "30s" -- paired with flow_control_rate.'),
       },
     },
-    async ({ destination_url, body, delay_seconds, retries, callback_url, flow_control_key, flow_control_rate, flow_control_parallelism, flow_control_period }) =>
+    async ({ destination_url, body, delay_seconds, retries, callback_url, extra_headers, flow_control_key, flow_control_rate, flow_control_parallelism, flow_control_period }) =>
       text(
         await qstash.qstashPublish(env, destination_url, body, {
           delaySeconds: delay_seconds,
           retries,
           callbackUrl: callback_url,
+          extraHeaders: extra_headers,
           flowControl: flow_control_key
             ? { key: flow_control_key, rate: flow_control_rate, parallelism: flow_control_parallelism, period: flow_control_period }
             : undefined,
