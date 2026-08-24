@@ -96,11 +96,16 @@ async function captureEvent(
     const resp = await fetch(ingestUrl(env), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // distinct_id lives INSIDE properties, per PostHog's documented
+      // /i/v0/e/ shape -- NOT as a top-level sibling of `properties`.
+      // (A top-level distinct_id was tried first and DID appear to work
+      // for a plain custom event during live testing of this cell, but
+      // that's undocumented behavior this file shouldn't rely on --
+      // match the documented shape exactly, for both event kinds.)
       body: JSON.stringify({
         api_key: apiKey,
         event,
-        distinct_id: distinctId,
-        properties,
+        properties: { distinct_id: distinctId, ...properties },
         timestamp: new Date().toISOString(),
       }),
     });
@@ -120,11 +125,37 @@ export async function postHogCaptureException(
 ): Promise<string> {
   const message = args.message.slice(0, 2000);
   return captureEvent(env, "$exception", `codecell-${args.cellId}`, {
+    // PostHog's $exception event has its own, SEPARATELY VALIDATED
+    // ingestion path -- unlike a plain custom event, a malformed
+    // $exception_list is silently dropped before it ever reaches the
+    // raw events table (confirmed live while building this cell: a
+    // version without `stacktrace` produced zero rows, queried
+    // directly via HogQL, not just "missing from the Error Tracking
+    // issue view"). PostHog's own docs note the schema is strict enough
+    // that even their own SDKs recommend never hand-building this event
+    // (see posthog.com/docs/error-tracking/capture) -- since this
+    // Worker has no client-side call stack to report (there's no
+    // JS Error object; the "exception" here is a CodeCell's test
+    // failure, reported as a log string), `frames` is necessarily a
+    // single synthetic frame describing WHERE in this pipeline the
+    // failure was recorded, not an actual call stack.
     $exception_list: [
       {
         type: "CodeCellFailure",
         value: message,
-        mechanism: { synthetic: true, handled: true },
+        mechanism: { handled: true, synthetic: true },
+        stacktrace: {
+          type: "raw",
+          frames: [
+            {
+              platform: "custom",
+              lang: "other",
+              function: "code_cell_workflow.notify",
+              filename: "code_cell_workflow.ts",
+              in_app: true,
+            },
+          ],
+        },
       },
     ],
     $exception_type: "CodeCellFailure",
