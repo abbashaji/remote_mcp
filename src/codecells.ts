@@ -62,12 +62,12 @@ export async function ensureSchema(env: TursoEnv): Promise<void> {
     ],
     "write",
   );
-  // Idempotent column additions for the optional B2 artifact-routing
-  // integration below -- a plain CREATE TABLE IF NOT EXISTS above won't
-  // add columns to a `checkpoints` table that already existed before
-  // this feature shipped, so these run as their own best-effort
-  // ALTER TABLEs, swallowing "column already exists" specifically.
+  // Idempotent column additions -- a plain CREATE TABLE IF NOT EXISTS
+  // above won't add columns to tables that already existed before a
+  // feature shipped, so these run as their own best-effort ALTER
+  // TABLEs, swallowing "column already exists" specifically.
   await ensureArtifactColumns(client);
+  await ensureOpenHandsColumns(client);
 }
 
 async function ensureArtifactColumns(client: Client): Promise<void> {
@@ -86,6 +86,47 @@ async function ensureArtifactColumns(client: Client): Promise<void> {
   }
 }
 
+// Section 4g: OpenHands as a second, more-capable generation lane. No
+// CHECK constraint on execution_mode -- same style as the existing `tag`
+// column, validated in application code (the cell_create tool's zod
+// enum) rather than at the schema level, since ALTER TABLE ... ADD
+// COLUMN with an inline CHECK has spottier cross-version SQLite/libSQL
+// support than a plain typed column.
+//
+//   execution_mode      -- 'pipeline' (default, today's Fast Worker
+//                           cascade) or 'openhands' (delegates initial
+//                           generation to an OpenHands iterate-until-it-
+//                           works loop instead). Set at cell_create time.
+//   openhands_attempted -- guard rail: OpenHands gets at most ONE turn
+//                           per cell, whether that's because
+//                           execution_mode was 'openhands' from the
+//                           start or because a 'pipeline' cell's test
+//                           failed and got auto-escalated. Never reset.
+//   openhands_run_id    -- the GitHub Actions run id from whichever
+//                           openhands-run.yml dispatch actually ran, for
+//                           linking back to logs.
+//   openhands_result    -- short outcome summary distinct from the
+//                           generic `tag`/`last_error` fields, so a
+//                           Reviewer session can tell "OpenHands
+//                           generated code that then passed/failed"
+//                           apart from a plain single-shot Fast Worker
+//                           outcome.
+async function ensureOpenHandsColumns(client: Client): Promise<void> {
+  const alters = [
+    `ALTER TABLE code_cells ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'pipeline'`,
+    `ALTER TABLE code_cells ADD COLUMN openhands_attempted INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE code_cells ADD COLUMN openhands_run_id TEXT`,
+    `ALTER TABLE code_cells ADD COLUMN openhands_result TEXT`,
+  ];
+  for (const sql of alters) {
+    try {
+      await client.execute(sql);
+    } catch (e) {
+      if (!String(e).toLowerCase().includes("duplicate column")) throw e;
+    }
+  }
+}
+
 export interface CellRow {
   id: number;
   status: string;
@@ -97,13 +138,22 @@ export interface CellRow {
   retry_count: number;
   last_error: string | null;
   updated_at: string;
+  execution_mode: string;
+  openhands_attempted: number;
+  openhands_run_id: string | null;
+  openhands_result: string | null;
 }
 
-export async function createCell(env: TursoEnv, spec: string, role: string): Promise<number> {
+export async function createCell(
+  env: TursoEnv,
+  spec: string,
+  role: string,
+  executionMode: string = "pipeline",
+): Promise<number> {
   const client = getWorkflowClient(env);
   const rs = await client.execute({
-    sql: "INSERT INTO code_cells (spec, role) VALUES (?, ?) RETURNING id",
-    args: [spec, role],
+    sql: "INSERT INTO code_cells (spec, role, execution_mode) VALUES (?, ?, ?) RETURNING id",
+    args: [spec, role, executionMode],
   });
   return Number(rs.rows[0].id);
 }
@@ -118,15 +168,26 @@ export async function updateCell(
     tag: string;
     retry_count: number;
     last_error: string | null;
+    execution_mode: string;
+    openhands_attempted: boolean;
+    openhands_run_id: string | null;
+    openhands_result: string | null;
   }>,
 ): Promise<void> {
   const client = getWorkflowClient(env);
   const columns = Object.keys(fields);
   if (columns.length === 0) return;
   const setClause = columns.map((c) => `"${c}" = ?`).join(", ") + ", updated_at = datetime('now')";
+  const values = columns.map((c) => {
+    const v = (fields as Record<string, unknown>)[c];
+    // libSQL binds booleans inconsistently across drivers -- normalize to
+    // 0/1 explicitly rather than relying on client-side coercion, same as
+    // openhands_attempted's INTEGER column expects.
+    return typeof v === "boolean" ? (v ? 1 : 0) : v;
+  });
   await client.execute({
     sql: `UPDATE code_cells SET ${setClause} WHERE id = ?`,
-    args: [...(Object.values(fields) as any[]), cellId],
+    args: [...(values as any[]), cellId],
   });
 }
 
