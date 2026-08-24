@@ -56,7 +56,7 @@ import type { Env } from "./index";
 import { groqChatCompletion } from "./groq";
 import { geminiGenerateContent } from "./gemini";
 import { githubTriggerWorkflow } from "./github";
-import { discordSendMessage } from "./discord";
+import { sendWebPushToAll } from "./push";
 import { qstashPublish } from "./qstash";
 import { updateCell, getCell } from "./codecells";
 import { postHogCaptureException, postHogCaptureCodeCellResolution } from "./posthog_events";
@@ -231,20 +231,23 @@ async function classifyAndRecordResult(
 }
 
 // ---------------------------------------------------------------------
-// Section 4 step 7/8: urgent tags (needs_human, dead_letter) alert
-// Discord immediately; known_flake_pattern is logged but left for a
-// batched digest (Section 3b) rather than paging anyone.
+// Section 4 step 7/8: urgent tags (needs_human, dead_letter) alert the
+// operator immediately via Web Push (migrated off Discord Webhooks --
+// see web-push-migration-instructions.md; same job, same trigger
+// points, same Failed/Dead_Letter distinction); known_flake_pattern is
+// logged but left for a batched digest (Section 3b) rather than paging
+// anyone.
 //
 // Section 10 (third destination, wired here): the same call that would
-// otherwise only alert Discord now ALSO posts to PostHog's error-
+// otherwise only send a push alert now ALSO posts to PostHog's error-
 // tracking capture endpoint (posthog_events.ts), on every Failed/
-// Dead_Letter transition -- a strictly wider condition than Discord's
-// "urgent" (needs_human/dead_letter) gate, since Section 10 wants
-// known_flake_pattern failures in the trend data too even though they
-// don't page anyone. This is intentionally the ONLY new write added
-// here -- no new trigger logic, per Section 10's "same Worker call...
-// no new trigger logic, just an additional write alongside two that
-// already exist."
+// Dead_Letter transition -- a strictly wider condition than the push
+// alert's "urgent" (needs_human/dead_letter) gate, since Section 10
+// wants known_flake_pattern failures in the trend data too even though
+// they don't page anyone. This is intentionally the ONLY new write
+// added here -- no new trigger logic, per Section 10's "same Worker
+// call... no new trigger logic, just an additional write alongside two
+// that already exist."
 //
 // Non-overlap rule (Section 10): PostHog is a read/trend surface only.
 // Nothing downstream of this call reads PostHog to decide pipeline
@@ -259,6 +262,13 @@ async function classifyAndRecordResult(
 // error STRING, matching this project's convention) -- belt and
 // suspenders against a PostHog outage cascading into a Workflow step
 // failure.
+//
+// The push send itself (sendWebPushToAll, push.ts) is allowed to
+// propagate a non-expiry error -- unlike PostHog's belt-and-suspenders
+// swallow above, a genuine push-delivery failure should surface via
+// this step.do()'s normal step-failure path (migration doc Phase 5's
+// "let this follow the same Failed/Dead_Letter path everything else
+// does -- don't swallow silently"), not be silently absorbed here too.
 // ---------------------------------------------------------------------
 async function notify(
   env: Env,
@@ -266,13 +276,17 @@ async function notify(
   tag: string,
   details?: { status?: string; lastError?: string; provider?: string },
 ): Promise<void> {
-  const discordUrgent = tag === "needs_human" || tag === "dead_letter";
-  if (discordUrgent && env.DISCORD_BOT_TOKEN && env.DISCORD_ALERT_CHANNEL_ID) {
-    await discordSendMessage(env.DISCORD_BOT_TOKEN, env.DISCORD_ALERT_CHANNEL_ID, `⚠️ CodeCell #${cellId} — \`${tag}\`, needs a look.`);
+  const pushUrgent = tag === "needs_human" || tag === "dead_letter";
+  if (pushUrgent) {
+    await sendWebPushToAll(env, {
+      title: "Ondine Alert",
+      body: `CodeCell #${cellId} — ${tag}, needs a look.`,
+      tag,
+    });
   }
 
   // PostHog: every Failed/Dead_Letter transition, not just the subset
-  // that pages Discord -- see the block comment above.
+  // that sends a push alert -- see the block comment above.
   const isFailureTransition = tag !== "passed";
   if (isFailureTransition) {
     try {
