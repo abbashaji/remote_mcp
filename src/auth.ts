@@ -6,7 +6,8 @@
 // step of the OAuth dance -- a couple of machine-to-machine webhook
 // routes that resolve CodeCellWorkflow's durable waits, two more that
 // back Neo4j's embedding-backfill and keepalive QStash schedules
-// (Section 7), and (Section 12) the operator dashboard's three routes.
+// (Section 7), (Section 12) the operator dashboard's three routes, and
+// (Web Push migration) the subscribe surface's four routes.
 //
 // Since this server has exactly one user (you), "consent" is just:
 // prove you know MCP_AUTH_TOKEN. No accounts, no database of users --
@@ -16,12 +17,22 @@
 // SAME secret directly (see dashboard.ts's checkDashboardAuth) rather
 // than running its own auth system -- the point from the spec is
 // reusing the credential, not replicating the OAuth dance for a single
-// HTML page.
+// HTML page. The Web Push subscribe surface (subscribe.ts) reuses the
+// exact same checkDashboardAuth mechanism, per
+// web-push-migration-instructions.md Phase 3's "same Worker, same
+// Bearer/Cloudflare Access gate already used for the MCP endpoint and
+// Section 12's dashboard -- do not stand up a separate auth path."
 
 import type { Env } from "./index";
 import { generateCode, type FastWorkerEventPayload } from "./code_cell_workflow";
 import { backfillPendingEmbeddings, touchHeartbeat } from "./graph";
 import { handleDashboardData, handleDashboardPage, handleDashboardWs } from "./dashboard";
+import {
+  handleVapidPublicKey,
+  handleSubscribeRegister,
+  handleSubscribePage,
+  handleServiceWorker,
+} from "./subscribe";
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -81,6 +92,27 @@ export const AuthHandler = {
     }
     if (url.pathname === "/dashboard/ws") {
       return handleDashboardWs(request, env);
+    }
+
+    // Web Push migration (web-push-migration-instructions.md Phases 3-4):
+    // the subscribe surface that replaces "join the Discord server" as
+    // the operator's out-of-band alert channel. GET /subscribe and
+    // GET /vapid-public-key and POST /subscribe/register are gated by
+    // the same checkDashboardAuth mechanism as the dashboard above --
+    // Phase 3's "do not stand up a separate auth path." GET /sw.js is
+    // deliberately unauthed (static, non-secret service-worker JS the
+    // browser fetches on its own).
+    if (url.pathname === "/subscribe" && request.method === "GET") {
+      return handleSubscribePage(request, env);
+    }
+    if (url.pathname === "/vapid-public-key" && request.method === "GET") {
+      return handleVapidPublicKey(request, env);
+    }
+    if (url.pathname === "/subscribe/register" && request.method === "POST") {
+      return handleSubscribeRegister(request, env);
+    }
+    if (url.pathname === "/sw.js" && request.method === "GET") {
+      return handleServiceWorker();
     }
 
     // Section 4f's QStash pacing layer. CodeCellWorkflow's
