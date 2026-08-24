@@ -241,3 +241,8 @@ class_name = "CodeCellWorkflow"
 #                                No wrangler binding needed (plain
 #                                authenticated HTTP out, same shape as
 #                                UPSTASH_*/GROQ_API_KEY above).
+
+# --- Git-integration secrets-wiping test (harmless no-op comment) ---------
+# Added solely to trigger an auto-deploy via Cloudflare's connected-repo
+# Workers Builds integration, to confirm it does NOT clear out-of-band
+# secrets (`wrangler secret put`) on deploy. Safe to delete after the test.
