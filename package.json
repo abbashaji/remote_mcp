@@ -9,6 +9,7 @@
     "tail": "wrangler tail"
   },
   "dependencies": {
+    "@block65/webcrypto-web-push": "^1.0.2",
     "@cloudflare/workers-oauth-provider": "^0.10.3",
     "@libsql/client": "^0.15.15",
     "@modelcontextprotocol/server": "^2.0.0",
