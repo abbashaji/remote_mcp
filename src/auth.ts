@@ -7,7 +7,7 @@
 // routes that resolve CodeCellWorkflow's durable waits, two more that
 // back Neo4j's embedding-backfill and keepalive QStash schedules
 // (Section 7), (Section 12) the operator dashboard's three routes, and
-// (Web Push migration) the subscribe surface's four routes.
+// (Web Push migration) the subscribe surface's routes.
 //
 // Since this server has exactly one user (you), "consent" is just:
 // prove you know MCP_AUTH_TOKEN. No accounts, no database of users --
@@ -30,6 +30,7 @@ import { handleDashboardData, handleDashboardPage, handleDashboardWs } from "./d
 import {
   handleVapidPublicKey,
   handleSubscribeRegister,
+  handleSubscribeTest,
   handleSubscribePage,
   handleServiceWorker,
 } from "./subscribe";
@@ -101,7 +102,12 @@ export const AuthHandler = {
     // the same checkDashboardAuth mechanism as the dashboard above --
     // Phase 3's "do not stand up a separate auth path." GET /sw.js is
     // deliberately unauthed (static, non-secret service-worker JS the
-    // browser fetches on its own).
+    // browser fetches on its own). POST /subscribe/test is a manual
+    // verification route (same auth) that fires a canned notification
+    // to every registered subscription via sendWebPushToAll -- not part
+    // of the real alert path, added to confirm the
+    // @block65/webcrypto-web-push integration actually delivers without
+    // needing to force a CodeCell into Failed/Dead_Letter.
     if (url.pathname === "/subscribe" && request.method === "GET") {
       return handleSubscribePage(request, env);
     }
@@ -110,6 +116,9 @@ export const AuthHandler = {
     }
     if (url.pathname === "/subscribe/register" && request.method === "POST") {
       return handleSubscribeRegister(request, env);
+    }
+    if (url.pathname === "/subscribe/test" && request.method === "POST") {
+      return handleSubscribeTest(request, env);
     }
     if (url.pathname === "/sw.js" && request.method === "GET") {
       return handleServiceWorker();
