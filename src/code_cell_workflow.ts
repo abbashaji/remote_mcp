@@ -2,11 +2,11 @@
 //
 // Section 4f: one Workflow instance per CodeCell. Deliberately built on
 // this Worker's OWN existing helper modules (groq.ts, gemini.ts,
-// github.ts, discord.ts, codecells.ts) rather than a second Worker with
-// its own copies of the same calls -- this project already has exactly
-// one Cloudflare account, one set of provider secrets, and (per Claude's
-// one custom-connector-slot limit) needs to stay reachable at a single
-// MCP endpoint. See workflows.ts for the pre-existing generic JobWorkflow
+// github.ts, push.ts, codecells.ts) rather than a second Worker with its
+// own copies of the same calls -- this project already has exactly one
+// Cloudflare account, one set of provider secrets, and (per Claude's one
+// custom-connector-slot limit) needs to stay reachable at a single MCP
+// endpoint. See workflows.ts for the pre-existing generic JobWorkflow
 // this project already had; CodeCellWorkflow is the same durable-Workflow
 // pattern, just with real business logic instead of generic GET/sleep steps.
 //
@@ -25,6 +25,18 @@
 // callback resolves a durable wait" pattern already used for
 // heavy-worker-result, just self-triggered by our own QStash publish
 // rather than an external GitHub Actions runner.
+//
+// Web Push migration addendum (web-push-migration-instructions.md):
+// notify()'s alert half no longer posts to Discord. It calls push.ts's
+// sendWebPushToAll() instead, sending to every device registered via
+// the /subscribe surface (subscribe.ts). Deliberately NOT wrapped in a
+// try/catch here the way the PostHog capture below is -- push.ts's own
+// header comment is explicit that a non-expiry send failure should
+// propagate "so notify()'s caller can let them follow the same Failed/
+// Dead_Letter path everything else in this repo already uses," i.e. a
+// genuine alert-delivery failure is allowed to fail the "notify" step
+// itself (Workflows' own step-retry behavior applies), unlike a PostHog
+// trend-data hiccup, which must never block anything.
 //
 // Section 4g addendum: OpenHands (open-source, model-agnostic autonomous
 // coding agent) as a SECOND generation front-end, alongside the Fast
@@ -232,22 +244,19 @@ async function classifyAndRecordResult(
 
 // ---------------------------------------------------------------------
 // Section 4 step 7/8: urgent tags (needs_human, dead_letter) alert the
-// operator immediately via Web Push (migrated off Discord Webhooks --
-// see web-push-migration-instructions.md; same job, same trigger
-// points, same Failed/Dead_Letter distinction); known_flake_pattern is
-// logged but left for a batched digest (Section 3b) rather than paging
-// anyone.
+// operator's subscribed devices via Web Push (push.ts's
+// sendWebPushToAll) -- replaces the earlier Discord-webhook alert per
+// web-push-migration-instructions.md. known_flake_pattern is logged
+// (via the PostHog write below) but left for a batched digest (Section
+// 3b) rather than pushing a notification to anyone.
 //
 // Section 10 (third destination, wired here): the same call that would
-// otherwise only send a push alert now ALSO posts to PostHog's error-
+// otherwise only push a notification now ALSO posts to PostHog's error-
 // tracking capture endpoint (posthog_events.ts), on every Failed/
 // Dead_Letter transition -- a strictly wider condition than the push
-// alert's "urgent" (needs_human/dead_letter) gate, since Section 10
+// gate's "urgent" (needs_human/dead_letter) scope, since Section 10
 // wants known_flake_pattern failures in the trend data too even though
-// they don't page anyone. This is intentionally the ONLY new write
-// added here -- no new trigger logic, per Section 10's "same Worker
-// call... no new trigger logic, just an additional write alongside two
-// that already exist."
+// they don't push a notification to anyone.
 //
 // Non-overlap rule (Section 10): PostHog is a read/trend surface only.
 // Nothing downstream of this call reads PostHog to decide pipeline
@@ -255,20 +264,17 @@ async function classifyAndRecordResult(
 // before notify() runs) remains the only source of truth orchestration
 // logic reads.
 //
-// Optional, not load-bearing (Section 10): a PostHog capture failure is
-// caught and logged here, never rethrown -- it must not fail this step
-// or block the Failed/Dead_Letter transition it's attached to. This is
-// why postHogCaptureException itself also never throws (returns an
-// error STRING, matching this project's convention) -- belt and
-// suspenders against a PostHog outage cascading into a Workflow step
-// failure.
-//
-// The push send itself (sendWebPushToAll, push.ts) is allowed to
-// propagate a non-expiry error -- unlike PostHog's belt-and-suspenders
-// swallow above, a genuine push-delivery failure should surface via
-// this step.do()'s normal step-failure path (migration doc Phase 5's
-// "let this follow the same Failed/Dead_Letter path everything else
-// does -- don't swallow silently"), not be silently absorbed here too.
+// Push-failure handling is intentionally asymmetric with the PostHog
+// block below it: sendWebPushToAll() is awaited directly, NOT wrapped
+// in a try/catch here, so a genuine delivery failure (not a pruned
+// expired subscription -- push.ts already handles that case internally
+// and doesn't throw for it) propagates out of notify() and fails
+// whichever step.do("notify"/"dead-letter", ...) call is currently
+// running it, exactly as push.ts's own header comment describes.
+// PostHog capture failures, by contrast, are always caught and logged
+// here (and inside postHogCaptureException itself, which also never
+// throws) -- a trend-data hiccup must never block anything, matching
+// Section 10's "optional, not load-bearing" framing.
 // ---------------------------------------------------------------------
 async function notify(
   env: Env,
@@ -279,14 +285,14 @@ async function notify(
   const pushUrgent = tag === "needs_human" || tag === "dead_letter";
   if (pushUrgent) {
     await sendWebPushToAll(env, {
-      title: "Ondine Alert",
-      body: `CodeCell #${cellId} — ${tag}, needs a look.`,
-      tag,
+      title: `CodeCell #${cellId}`,
+      body: `Reached '${tag}'${details?.lastError ? `: ${details.lastError.slice(0, 200)}` : ""}`,
+      tag: `codecell-${cellId}`,
     });
   }
 
   // PostHog: every Failed/Dead_Letter transition, not just the subset
-  // that sends a push alert -- see the block comment above.
+  // that pushes a notification -- see the block comment above.
   const isFailureTransition = tag !== "passed";
   if (isFailureTransition) {
     try {
@@ -333,6 +339,18 @@ function requireFastWorkerCallbackToken(env: Env): string {
     );
   }
   return env.FAST_WORKER_CALLBACK_TOKEN;
+}
+
+function requireOpenHandsCallbackToken(env: Env): string {
+  if (!env.OPENHANDS_CALLBACK_TOKEN) {
+    throw new Error(
+      "OPENHANDS_CALLBACK_TOKEN is not configured on this Worker. Run: wrangler secret put OPENHANDS_CALLBACK_TOKEN " +
+        "(a random secret, e.g. `openssl rand -hex 32`). Also set the SAME value as a repo secret named " +
+        "OPENHANDS_CALLBACK_TOKEN on whichever repo runs openhands-run.yml -- that job forwards it as a " +
+        "bearer token when it POSTs back to /webhook/openhands-result (auth.ts).",
+    );
+  }
+  return env.OPENHANDS_CALLBACK_TOKEN;
 }
 
 // Section 4g: the repo containing .github/workflows/openhands-run.yml.
@@ -383,7 +401,7 @@ async function runGenerateTestTagCycle(
     await step.do(`openhands-generate-dispatch-${label}`, async () => {
       await updateCell(env, cellId, { status: "Processing_Drafting" });
       const workerUrl = requireWorkerUrl(env);
-      const token = requireOpenHandsCallbackToken(env);
+      requireOpenHandsCallbackToken(env); // presence check only -- the token itself lives as a repo secret, see openhands-run.yml
       const repo = resolveOpenHandsRepo(env);
 
       let task = spec;
@@ -402,11 +420,6 @@ async function runGenerateTestTagCycle(
         callback_url: `${workerUrl}/webhook/openhands-result`,
       });
       if (result.startsWith("Failed to trigger")) throw new Error(result);
-      // Deliberately no Authorization header/token passed as a workflow
-      // input above -- OPENHANDS_CALLBACK_TOKEN lives as a GitHub
-      // repo-level secret on the SAME repo (see openhands-run.yml),
-      // never transiting through this dispatch call's plaintext inputs.
-      void token;
     });
 
     const ohEvent = await step.waitForEvent<OpenHandsResultPayload>(`openhands-generate-wait-${label}`, {
@@ -487,18 +500,6 @@ async function runGenerateTestTagCycle(
   );
 
   return { tag, provider: draft.provider };
-}
-
-function requireOpenHandsCallbackToken(env: Env): string {
-  if (!env.OPENHANDS_CALLBACK_TOKEN) {
-    throw new Error(
-      "OPENHANDS_CALLBACK_TOKEN is not configured on this Worker. Run: wrangler secret put OPENHANDS_CALLBACK_TOKEN " +
-        "(a random secret, e.g. `openssl rand -hex 32`). Also set the SAME value as a repo secret named " +
-        "OPENHANDS_CALLBACK_TOKEN on whichever repo runs openhands-run.yml -- that job forwards it as a " +
-        "bearer token when it POSTs back to /webhook/openhands-result (auth.ts).",
-    );
-  }
-  return env.OPENHANDS_CALLBACK_TOKEN;
 }
 
 export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowParams> {
