@@ -71,7 +71,9 @@ export interface Env {
   RUNNER: DurableObjectNamespace<TaskRunner>;
   CODE_CELL_WORKFLOW: Workflow<import("./code_cell_workflow").CodeCellWorkflowParams>;
   DASHBOARD_HUB: DurableObjectNamespace<DashboardHub>; // Section 12c: operator-dashboard poll/broadcast DO -- see dashboard_do.ts
-  DISCORD_ALERT_CHANNEL_ID?: string;
+  VAPID_PUBLIC_KEY?: string; // Web Push migration Phase 1 -- browser-facing public key, also served via GET /vapid-public-key
+  VAPID_PRIVATE_KEY?: string; // Web Push migration Phase 1 -- never leaves this Worker; signs push payloads via @block65/webcrypto-web-push
+  VAPID_SUBJECT?: string; // Web Push migration Phase 1 -- "mailto:you@example.com", required by the VAPID spec
   HEAVY_WORKER_REPO?: string; // "owner/name" -- repo containing .github/workflows/test.yml
   HEAVY_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /webhook/heavy-worker-result
   WORKER_URL?: string; // this Worker's own https://....workers.dev base URL (Section 4f QStash self-dispatch)
@@ -1128,6 +1130,12 @@ function buildServer(env: Env): McpServer {
   // Direct wrapper over Discord's Bot REST API (discord.com/api/v10).
   // Requires a Discord bot application, invited to the target server(s)
   // with the relevant permissions, and its token in DISCORD_BOT_TOKEN.
+  // General-purpose Discord surface -- kept as-is by the Web Push
+  // migration (web-push-migration-instructions.md), which only replaces
+  // the out-of-band ALERT job (see notify() in code_cell_workflow.ts,
+  // now backed by push.ts's sendWebPushToAll). Nothing here reads
+  // DISCORD_ALERT_CHANNEL_ID anymore -- that var existed solely for the
+  // alert path and has been removed.
 
   server.registerTool(
     "discord_send_message",
