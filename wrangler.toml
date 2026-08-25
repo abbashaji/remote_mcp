@@ -64,7 +64,12 @@ class_name = "CodeCellWorkflow"
 #                            applications (Bot tab -> Reset Token). Invite
 #                            the bot to each server it needs to act in,
 #                            with the relevant permissions (Send Messages,
-#                            Manage Channels, Add Reactions, etc.).
+#                            Manage Channels, Add Reactions, etc.). Powers
+#                            the general-purpose discord_* MCP tools only
+#                            as of the Web Push migration below -- the
+#                            out-of-band ALERT channel now uses
+#                            VAPID_* / Web Push instead (see
+#                            web-push-migration-instructions.md).
 #   CLOUDFLARE_API_TOKEN  -- scoped API token (NOT the Global API Key) for
 #                            the cloudflare_search/cloudflare_execute
 #                            proxy tools, which forward to Cloudflare's
@@ -170,6 +175,20 @@ class_name = "CodeCellWorkflow"
 #                            (same mechanism FAST_WORKER_CALLBACK_TOKEN
 #                            uses -- see auth.ts and qstash.ts).
 #
+# --- Web Push (VAPID) -- out-of-band operator alerts ------------------------
+# Replaces Discord Webhooks' one job (web-push-migration-instructions.md
+# Phase 1). Generate once with `npx web-push generate-vapid-keys`; never
+# regenerate unless compromised, since browsers pin the public key per
+# origin. See push.ts and subscribe.ts.
+#   VAPID_PRIVATE_KEY     -- never leaves this Worker; signs every push
+#                            payload via @block65/webcrypto-web-push.
+#   VAPID_PUBLIC_KEY      -- also served in plaintext at GET
+#                            /vapid-public-key so the subscribe page
+#                            (Phase 4) can read it without a client
+#                            redeploy on rotation.
+#   VAPID_SUBJECT         -- "mailto:you@example.com", required by the
+#                            VAPID spec.
+#
 # --- CodeCellWorkflow-specific (code_cell_workflow.ts) ---------------------
 #   HEAVY_WORKER_REPO         -- "owner/name" of the repo containing
 #                                .github/workflows/test.yml, e.g.
@@ -186,10 +205,6 @@ class_name = "CodeCellWorkflow"
 #                                and variables -> Actions, alongside
 #                                GATEWAY_URL (this Worker's own
 #                                https://....workers.dev base URL).
-#   DISCORD_ALERT_CHANNEL_ID  -- channel (snowflake id) urgent CodeCell
-#                                tags (needs_human, dead_letter) get
-#                                posted to. Optional -- alerts are skipped
-#                                if unset. Reuses DISCORD_BOT_TOKEN above.
 #   FAST_WORKER_CALLBACK_TOKEN -- a random secret (e.g. `openssl rand -hex
 #                                32`), checked on POST
 #                                /qstash/fast-worker-generate. Deliberately
