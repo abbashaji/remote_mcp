@@ -20,7 +20,9 @@ id = "587f72d065cb45e1b3c0a68d556cafe5"
 # https://....workers.dev base URL -- CodeCellWorkflow's
 # fast-worker-dispatch step needs it to publish a QStash message back to
 # this same Worker's own /qstash/fast-worker-generate route (Section 4f;
-# see code_cell_workflow.ts and auth.ts). Also the base URL Section 7d/7f's
+# see code_cell_workflow.ts and auth.ts), and Section 4g's OpenHands
+# generation lane needs it to build the callback_url it hands to
+# openhands-run.yml. Also the base URL Section 7d/7f's
 # graph-embedding-backfill/graph-heartbeat QStash schedules point at.
 # Update this if the Worker is ever renamed or moved to a custom domain.
 [vars]
@@ -45,9 +47,10 @@ tag = "v1"
 new_sqlite_classes = ["TaskRunner"]
 
 # CodeCellWorkflow (code_cell_workflow.ts): Section 4f's durable per-cell
-# pipeline (Fast Worker -> Heavy Worker -> tag -> notify). Triggered via
-# the cell_create MCP tool; resumed by /webhook/heavy-worker-result and
-# /qstash/fast-worker-generate (auth.ts) via step.waitForEvent.
+# pipeline (Fast Worker or, per Section 4g, OpenHands -> Heavy Worker ->
+# tag -> notify). Triggered via the cell_create MCP tool; resumed by
+# /webhook/heavy-worker-result, /qstash/fast-worker-generate, and
+# /webhook/openhands-result (auth.ts) via step.waitForEvent.
 [[workflows]]
 binding = "CODE_CELL_WORKFLOW"
 name = "turso-github-mcp-code-cell-workflow"
@@ -194,6 +197,10 @@ class_name = "CodeCellWorkflow"
 #                                .github/workflows/test.yml, e.g.
 #                                "abbashaji/ondine". Reuses GITHUB_TOKEN
 #                                above (needs repo + workflow scopes).
+#                                Also the DEFAULT repo Section 4g's
+#                                OpenHands lane looks for
+#                                .github/workflows/openhands-run.yml in,
+#                                unless OPENHANDS_REPO overrides that.
 #   HEAVY_WORKER_CALLBACK_TOKEN -- a random secret ONLY the GitHub Actions
 #                                runner should know (e.g. `openssl rand
 #                                -hex 32`), checked on POST
@@ -236,6 +243,56 @@ class_name = "CodeCellWorkflow"
 #                                how many fast-worker-generate calls can
 #                                be in flight at once across every
 #                                instance.
+#   OPENHANDS_CALLBACK_TOKEN  -- Section 4g: a random secret (e.g.
+#                                `openssl rand -hex 32`), checked on POST
+#                                /webhook/openhands-result. Deliberately
+#                                separate from every other callback token
+#                                above -- same "a runner for one job
+#                                should only resolve that job's own wait"
+#                                reasoning as HEAVY_WORKER_CALLBACK_TOKEN.
+#                                Set as a repo secret of the SAME name in
+#                                whichever repo runs openhands-run.yml
+#                                (OPENHANDS_REPO below, or HEAVY_WORKER_REPO
+#                                if unset) -- that job forwards it as a
+#                                bearer token when it POSTs back.
+#   OPENHANDS_REPO            -- Section 4g: optional PLAINTEXT var, "owner/
+#                                name" of the repo containing
+#                                .github/workflows/openhands-run.yml.
+#                                Defaults to HEAVY_WORKER_REPO if unset --
+#                                both workflows want the same "public
+#                                repo, unmetered GitHub Actions runners"
+#                                property, and this project already has
+#                                exactly one such repo. Set this only if
+#                                OpenHands' workflow should live somewhere
+#                                else. NOT YET WIRED: openhands-run.yml
+#                                itself still needs a one-commit manual
+#                                add via the GitHub UI (this project's
+#                                GITHUB_TOKEN lacks `workflow` scope) --
+#                                see the draft at
+#                                abbashaji/ondine's
+#                                openhands-integration/openhands-run.workflow.yml.
+#                                Also needs two GitHub Actions repo secrets
+#                                (separate from this Worker's own secrets,
+#                                same as HEAVY_WORKER_CALLBACK_TOKEN
+#                                already requires):
+#                                  OPENHANDS_CALLBACK_TOKEN -- same value
+#                                    as the Worker secret above.
+#                                  OPENHANDS_LLM_API_KEY / OPENHANDS_LLM_MODEL
+#                                    -- the credential OpenHands' own agent
+#                                    uses for its internal plan/write/test
+#                                    loop. This is a SEPARATE credential
+#                                    surface from this Worker's
+#                                    GEMINI_API_KEY/GROQ_API_KEY (GitHub
+#                                    Actions secrets vs. Cloudflare Worker
+#                                    secrets) -- copying the same key value
+#                                    across both is the simplest start, but
+#                                    means OpenHands' calls draw on the
+#                                    same quota Section 12b's dashboard
+#                                    already tracks for the Fast Worker
+#                                    pool, invisibly. Prefer a dedicated
+#                                    key for OpenHands if you have one, so
+#                                    the dashboard's quota-headroom signal
+#                                    stays meaningful.
 #
 # --- Object storage (Section 9, revised: GitHub Releases + Backblaze B2) ---
 #   GITHUB_RELEASE_ARTIFACTS_REPO -- optional PLAINTEXT var (fine to add to
