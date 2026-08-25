@@ -3,11 +3,11 @@
 // The "defaultHandler" for @cloudflare/workers-oauth-provider: handles
 // every request that isn't an already-authenticated call to /mcp. In
 // practice that's GET/POST /authorize -- the human-in-the-loop consent
-// step of the OAuth dance -- a couple of machine-to-machine webhook
-// routes that resolve CodeCellWorkflow's durable waits, two more that
-// back Neo4j's embedding-backfill and keepalive QStash schedules
-// (Section 7), (Section 12) the operator dashboard's three routes, and
-// (Web Push migration) the subscribe surface's routes.
+// step of the OAuth dance -- a handful of machine-to-machine webhook
+// routes that resolve CodeCellWorkflow's durable waits (Section 4f/4g),
+// two more that back Neo4j's embedding-backfill and keepalive QStash
+// schedules (Section 7), (Section 12) the operator dashboard's three
+// routes, and (Web Push migration) the subscribe surface's routes.
 //
 // Since this server has exactly one user (you), "consent" is just:
 // prove you know MCP_AUTH_TOKEN. No accounts, no database of users --
@@ -216,6 +216,50 @@ export const AuthHandler = {
           type: "heavy-worker-result",
           payload: { passed: !!body.passed, log: body.log || "" },
         });
+        return new Response("ok\n", { status: 200 });
+      } catch (e) {
+        return new Response(`Error resolving workflow instance: ${e}`, { status: 500 });
+      }
+    }
+
+    // Section 4g callback: openhands-run.yml's last step posts the
+    // generation result here once the sandbox finishes (or times out /
+    // fails to produce output). This resolves CodeCellWorkflow's
+    // step.waitForEvent("openhands-result") -- see
+    // runGenerateTestTagCycle() in code_cell_workflow.ts. Mirrors
+    // /webhook/heavy-worker-result's shape and auth pattern exactly, with
+    // its own separate machine-to-machine secret (OPENHANDS_CALLBACK_TOKEN)
+    // for the same reason HEAVY_WORKER_CALLBACK_TOKEN is separate from
+    // FAST_WORKER_CALLBACK_TOKEN -- a GitHub Actions runner for one job
+    // should only ever be able to resolve that job's own wait, nothing
+    // else. Deliberately thin: this route only forwards the payload via
+    // sendEvent, it does not itself write to Turso (run_id/code get
+    // persisted inside the workflow's own step.do, same as every other
+    // webhook route in this file -- single source of truth for what a
+    // step actually did stays inside the step).
+    if (url.pathname === "/webhook/openhands-result" && request.method === "POST") {
+      if (!env.OPENHANDS_CALLBACK_TOKEN) {
+        return new Response("Server misconfigured: OPENHANDS_CALLBACK_TOKEN not set.", { status: 500 });
+      }
+      const auth = request.headers.get("Authorization") || "";
+      if (auth !== `Bearer ${env.OPENHANDS_CALLBACK_TOKEN}`) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let body: { workflow_instance_id?: string; code?: string; run_id?: string; error?: string };
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Malformed JSON body.", { status: 400 });
+      }
+      if (!body.workflow_instance_id) {
+        return new Response("workflow_instance_id required.", { status: 400 });
+      }
+      try {
+        const instance = await env.CODE_CELL_WORKFLOW.get(body.workflow_instance_id);
+        const payload = body.error
+          ? { error: body.error, run_id: body.run_id }
+          : { code: body.code || "", run_id: body.run_id };
+        await instance.sendEvent({ type: "openhands-result", payload });
         return new Response("ok\n", { status: 200 });
       } catch (e) {
         return new Response(`Error resolving workflow instance: ${e}`, { status: 500 });
