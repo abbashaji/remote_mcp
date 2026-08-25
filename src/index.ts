@@ -80,6 +80,8 @@ export interface Env {
   FAST_WORKER_CALLBACK_TOKEN?: string; // machine-to-machine secret for /qstash/fast-worker-generate
   FAST_WORKER_RATE_PER_MINUTE?: string; // optional, defaults to "20" -- see code_cell_workflow.ts
   FAST_WORKER_PARALLELISM?: string; // optional -- see code_cell_workflow.ts
+  OPENHANDS_CALLBACK_TOKEN?: string; // Section 4g: machine-to-machine secret for /webhook/openhands-result, also set as a repo secret on whichever repo runs openhands-run.yml
+  OPENHANDS_REPO?: string; // Section 4g: optional, "owner/name" of the repo containing .github/workflows/openhands-run.yml -- defaults to HEAVY_WORKER_REPO if unset, see code_cell_workflow.ts
   GITHUB_RELEASE_ARTIFACTS_REPO?: string; // optional, defaults to "abbashaji/remote_mcp" -- see github_release.ts
   GRAPH_CRON_TOKEN?: string; // machine-to-machine secret for /webhook/graph-embedding-backfill and /webhook/graph-heartbeat (Section 7d, 7f)
   B2_KEY_ID?: string; // Backblaze B2 S3-compatible application key id -- see b2.ts
@@ -1267,29 +1269,38 @@ function buildServer(env: Env): McpServer {
   );
 
   // ---- cell_* (3 tools) -------------------------------------------------
-  // Section 4a/4f/5/5b/5c: the CodeCell pipeline. cell_create starts a
+  // Section 4a/4f/4g/5/5b/5c: the CodeCell pipeline. cell_create starts a
   // durable CodeCellWorkflow instance (fast-worker-generate ->
   // heavy-worker-dispatch -> wait for test.yml's callback -> tag -> notify,
-  // see code_cell_workflow.ts). cell_resume/checkpoint_write implement the
-  // generic cross-session resumability pattern from Section 5b/5c.
+  // or, per Section 4g, an OpenHands generation lane feeding the same
+  // heavy-worker-dispatch/tag/notify tail -- see code_cell_workflow.ts).
+  // cell_resume/checkpoint_write implement the generic cross-session
+  // resumability pattern from Section 5b/5c.
 
   server.registerTool(
     "cell_create",
     {
       description:
         "Insert a new Pending CodeCell (Section 4a) and start its CodeCellWorkflow instance. " +
-        "Requires HEAVY_WORKER_REPO to be set (the repo containing .github/workflows/test.yml).",
+        "Requires HEAVY_WORKER_REPO to be set (the repo containing .github/workflows/test.yml). " +
+        "execution_mode='openhands' (Section 4g) delegates initial code generation to an OpenHands " +
+        "iterate-until-it-works loop instead of the Fast Worker cascade -- use for tasks where a full " +
+        "autonomous agent loop is a better fit than this pipeline's own wiring; Heavy Worker's " +
+        "deterministic test still has final say either way. Leave as 'pipeline' (default) for everything " +
+        "else -- a pipeline-lane cell whose test fails still gets one automatic OpenHands escalation " +
+        "attempt before falling to Failed/Debugger, so this is rarely worth setting explicitly at creation.",
       inputSchema: {
         spec: z.string().describe("The task/spec text the Fast Worker will generate code from."),
         role: z.string().default("Architect").describe('e.g. "Architect", "Coder", "Reviewer", "Debugger"'),
+        execution_mode: z.enum(["pipeline", "openhands"]).default("pipeline"),
       },
     },
-    async ({ spec, role }) => {
+    async ({ spec, role, execution_mode }) => {
       try {
         await ensureSchema(env);
-        const cellId = await createCell(env, spec, role);
-        const instance = await env.CODE_CELL_WORKFLOW.create({ params: { cell_id: cellId, spec } });
-        return text(`Created CodeCell #${cellId}, started workflow instance ${instance.id}.`);
+        const cellId = await createCell(env, spec, role, execution_mode);
+        const instance = await env.CODE_CELL_WORKFLOW.create({ params: { cell_id: cellId, spec, execution_mode } });
+        return text(`Created CodeCell #${cellId} (execution_mode=${execution_mode}), started workflow instance ${instance.id}.`);
       } catch (e) {
         return text(`Error creating CodeCell: ${e}`);
       }
