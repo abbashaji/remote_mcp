@@ -413,7 +413,7 @@ async function runGenerateTestTagCycle(
           `Iterate past whatever that attempt got wrong.`;
       }
 
-      const result = await githubTriggerWorkflow(env.GITHUB_TOKEN!, repo, "openhands-run.yml", "main", {
+      const result = await githubTriggerWorkflow(env.GITHUB_TOKEN!, repo, "aider-run.yml", "main", {
         cell_id: String(cellId),
         workflow_instance_id: instanceId,
         task,
