@@ -199,6 +199,36 @@ export async function getCell(env: TursoEnv, cellId: number): Promise<CellRow | 
   return (rs.rows[0] as unknown as CellRow) ?? null;
 }
 
+// Section 4a's backstop: cells genuinely stuck in `Pending`.
+//
+// Nothing in this codebase ever sets a cell's status BACK to `Pending`
+// after creation (grep the repo -- the only INSERT ... status default
+// is createCell's). cell_create (index.ts) inserts the row and starts
+// its CodeCellWorkflow instance synchronously in the same tool call, and
+// that workflow's very first step moves the cell off `Pending` within
+// seconds under normal operation. So a cell still sitting in `Pending`
+// well after creation means one specific thing went wrong: the row
+// insert succeeded but the CODE_CELL_WORKFLOW.create() call that should
+// have followed it never did (a transient Workers/Workflows error, or
+// the request dying between the two calls) -- not a slow cell, an
+// orphaned one with no workflow instance anywhere ever watching it.
+//
+// 10 minutes matches the stale-lock threshold Section 5b/12b already use
+// elsewhere in this doc -- generous relative to how fast a healthy cell
+// actually leaves `Pending` (seconds), so this doesn't fire on cells
+// that are merely queued behind real work.
+export async function findStuckPendingCells(env: TursoEnv, thresholdMinutes = 10): Promise<CellRow[]> {
+  const client = getWorkflowClient(env);
+  const rs = await client.execute({
+    sql: `SELECT * FROM code_cells
+          WHERE status = 'Pending' AND created_at < datetime('now', ?)
+          ORDER BY created_at ASC
+          LIMIT 50`,
+    args: [`-${thresholdMinutes} minutes`],
+  });
+  return rs.rows as unknown as CellRow[];
+}
+
 // Section 5b/5c: generic resume query -- non-terminal cells first, stale
 // locks (untouched >10 min) prioritized over fresh ones.
 export async function resumeCandidate(env: TursoEnv): Promise<CellRow | null> {
