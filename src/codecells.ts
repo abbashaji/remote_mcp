@@ -67,7 +67,7 @@ export async function ensureSchema(env: TursoEnv): Promise<void> {
   // feature shipped, so these run as their own best-effort ALTER
   // TABLEs, swallowing "column already exists" specifically.
   await ensureArtifactColumns(client);
-  await ensureOpenHandsColumns(client);
+  await ensureAiderColumns(client);
 }
 
 async function ensureArtifactColumns(client: Client): Promise<void> {
@@ -86,37 +86,39 @@ async function ensureArtifactColumns(client: Client): Promise<void> {
   }
 }
 
-// Section 4g: OpenHands as a second, more-capable generation lane. No
-// CHECK constraint on execution_mode -- same style as the existing `tag`
+// Section 4g: Aider (https://aider.chat) as a second, more-capable
+// generation lane -- originally scaffolded around OpenHands, swapped to
+// Aider after OpenHands' CLI proved unusable under this project's
+// zero-cost token budget (see aider-run.yml's header comment). No CHECK
+// constraint on execution_mode -- same style as the existing `tag`
 // column, validated in application code (the cell_create tool's zod
 // enum) rather than at the schema level, since ALTER TABLE ... ADD
 // COLUMN with an inline CHECK has spottier cross-version SQLite/libSQL
 // support than a plain typed column.
 //
-//   execution_mode      -- 'pipeline' (default, today's Fast Worker
-//                           cascade) or 'openhands' (delegates initial
-//                           generation to an OpenHands iterate-until-it-
-//                           works loop instead). Set at cell_create time.
-//   openhands_attempted -- guard rail: OpenHands gets at most ONE turn
-//                           per cell, whether that's because
-//                           execution_mode was 'openhands' from the
-//                           start or because a 'pipeline' cell's test
-//                           failed and got auto-escalated. Never reset.
-//   openhands_run_id    -- the GitHub Actions run id from whichever
-//                           openhands-run.yml dispatch actually ran, for
-//                           linking back to logs.
-//   openhands_result    -- short outcome summary distinct from the
-//                           generic `tag`/`last_error` fields, so a
-//                           Reviewer session can tell "OpenHands
-//                           generated code that then passed/failed"
-//                           apart from a plain single-shot Fast Worker
-//                           outcome.
-async function ensureOpenHandsColumns(client: Client): Promise<void> {
+//   execution_mode  -- 'pipeline' (default, today's Fast Worker
+//                       cascade) or 'aider' (delegates initial
+//                       generation to an Aider iterate-until-it-works
+//                       loop instead). Set at cell_create time.
+//   aider_attempted -- guard rail: Aider gets at most ONE turn per
+//                       cell, whether that's because execution_mode was
+//                       'aider' from the start or because a 'pipeline'
+//                       cell's test failed and got auto-escalated.
+//                       Never reset.
+//   aider_run_id    -- the GitHub Actions run id from whichever
+//                       aider-run.yml dispatch actually ran, for
+//                       linking back to logs.
+//   aider_result    -- short outcome summary distinct from the generic
+//                       `tag`/`last_error` fields, so a Reviewer session
+//                       can tell "Aider generated code that then
+//                       passed/failed" apart from a plain single-shot
+//                       Fast Worker outcome.
+async function ensureAiderColumns(client: Client): Promise<void> {
   const alters = [
     `ALTER TABLE code_cells ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'pipeline'`,
-    `ALTER TABLE code_cells ADD COLUMN openhands_attempted INTEGER NOT NULL DEFAULT 0`,
-    `ALTER TABLE code_cells ADD COLUMN openhands_run_id TEXT`,
-    `ALTER TABLE code_cells ADD COLUMN openhands_result TEXT`,
+    `ALTER TABLE code_cells ADD COLUMN aider_attempted INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE code_cells ADD COLUMN aider_run_id TEXT`,
+    `ALTER TABLE code_cells ADD COLUMN aider_result TEXT`,
   ];
   for (const sql of alters) {
     try {
@@ -139,9 +141,9 @@ export interface CellRow {
   last_error: string | null;
   updated_at: string;
   execution_mode: string;
-  openhands_attempted: number;
-  openhands_run_id: string | null;
-  openhands_result: string | null;
+  aider_attempted: number;
+  aider_run_id: string | null;
+  aider_result: string | null;
 }
 
 export async function createCell(
@@ -169,9 +171,9 @@ export async function updateCell(
     retry_count: number;
     last_error: string | null;
     execution_mode: string;
-    openhands_attempted: boolean;
-    openhands_run_id: string | null;
-    openhands_result: string | null;
+    aider_attempted: boolean;
+    aider_run_id: string | null;
+    aider_result: string | null;
   }>,
 ): Promise<void> {
   const client = getWorkflowClient(env);
@@ -182,7 +184,7 @@ export async function updateCell(
     const v = (fields as Record<string, unknown>)[c];
     // libSQL binds booleans inconsistently across drivers -- normalize to
     // 0/1 explicitly rather than relying on client-side coercion, same as
-    // openhands_attempted's INTEGER column expects.
+    // aider_attempted's INTEGER column expects.
     return typeof v === "boolean" ? (v ? 1 : 0) : v;
   });
   await client.execute({
