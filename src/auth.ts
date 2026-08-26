@@ -24,7 +24,7 @@
 // Section 12's dashboard -- do not stand up a separate auth path."
 
 import type { Env } from "./index";
-import { generateCode, type FastWorkerEventPayload } from "./code_cell_workflow";
+import { generateCode, sweepPendingCells, type FastWorkerEventPayload } from "./code_cell_workflow";
 import { backfillPendingEmbeddings, touchHeartbeat } from "./graph";
 import { handleDashboardData, handleDashboardPage, handleDashboardWs } from "./dashboard";
 import {
@@ -66,6 +66,22 @@ function checkGraphCronAuth(request: Request, env: Env): Response | null {
   }
   const auth = request.headers.get("Authorization") || "";
   if (auth !== `Bearer ${env.GRAPH_CRON_TOKEN}`) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+  return null;
+}
+
+// Section 4a's backstop cron gets its own secret, same reasoning as
+// GRAPH_CRON_TOKEN above (and FAST_WORKER_CALLBACK_TOKEN vs
+// HEAVY_WORKER_CALLBACK_TOKEN before that): only QStash's own scheduled
+// call needs to know this value, so it doesn't share a token with routes
+// that have nothing to do with it.
+function checkPendingSweepAuth(request: Request, env: Env): Response | null {
+  if (!env.PENDING_SWEEP_TOKEN) {
+    return new Response("Server misconfigured: PENDING_SWEEP_TOKEN not set.", { status: 500 });
+  }
+  const auth = request.headers.get("Authorization") || "";
+  if (auth !== `Bearer ${env.PENDING_SWEEP_TOKEN}`) {
     return new Response("Unauthorized", { status: 401 });
   }
   return null;
@@ -293,6 +309,24 @@ export const AuthHandler = {
         return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
       } catch (e) {
         return new Response(`Error touching heartbeat: ${e}`, { status: 500 });
+      }
+    }
+
+    // Section 4a: the stuck-`Pending` backstop dashboard_signals.ts has
+    // been checking for and reporting as missing. Queries Turso for
+    // cells that have sat in `Pending` past findStuckPendingCells'
+    // threshold (10 min -- see codecells.ts) and starts the
+    // CodeCellWorkflow instance that should have started at cell_create
+    // time and never did. Wired to a low-frequency QStash schedule --
+    // see this repo's deploy notes for the actual cron in use.
+    if (url.pathname === "/webhook/pending-sweep" && request.method === "POST") {
+      const authError = checkPendingSweepAuth(request, env);
+      if (authError) return authError;
+      try {
+        const result = await sweepPendingCells(env);
+        return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+      } catch (e) {
+        return new Response(`Error sweeping stuck-Pending cells: ${e}`, { status: 500 });
       }
     }
 
