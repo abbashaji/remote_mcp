@@ -77,7 +77,7 @@ import { geminiGenerateContent } from "./gemini";
 import { githubTriggerWorkflow } from "./github";
 import { sendWebPushToAll } from "./push";
 import { qstashPublish } from "./qstash";
-import { updateCell, getCell } from "./codecells";
+import { updateCell, getCell, findStuckPendingCells } from "./codecells";
 import { postHogCaptureException, postHogCaptureCodeCellResolution } from "./posthog_events";
 
 export interface CodeCellWorkflowParams {
@@ -446,6 +446,7 @@ async function runGenerateTestTagCycle(
     draft = { code: aiderEvent.payload.code, provider: "aider" };
   } else {
     await step.do(`fast-worker-dispatch-${label}`, async () => {
+      await updateCell(env, cellId, { status: "Processing_Drafting" });
       const workerUrl = requireWorkerUrl(env);
       const token = requireFastWorkerCallbackToken(env);
       const rate = Number(env.FAST_WORKER_RATE_PER_MINUTE ?? "20");
@@ -506,6 +507,51 @@ async function runGenerateTestTagCycle(
   );
 
   return { tag, provider: draft.provider };
+}
+
+// ---------------------------------------------------------------------
+// Section 4a's stuck-`Pending` backstop. Wired to a low-frequency QStash
+// schedule hitting /webhook/pending-sweep (auth.ts), same shape as
+// Section 7d/7f's embedding-backfill/keepalive cron pair -- a
+// low-privilege machine-to-machine route, no MCP session involved.
+//
+// findStuckPendingCells (codecells.ts) already restricts the candidate
+// set to cells old enough that "never got a workflow instance" is the
+// only realistic explanation left (see that function's comment) -- so
+// the fix here is mechanical: start the CodeCellWorkflow instance that
+// should have started at cell_create time and never did. This does NOT
+// touch the cell's row itself (no status write, no retry_count bump);
+// the workflow's own first step does that exactly like it would have on
+// a normal, non-swept run, so a swept cell's history looks identical to
+// one whose instance just started a little late.
+//
+// One instance per stuck cell per sweep, best-effort: a create() failure
+// for one cell doesn't stop the rest from being attempted, and every
+// outcome (fired vs errored) is returned so the caller (auth.ts's
+// webhook handler) can report a real count rather than a bare "ok".
+export interface PendingSweepResult {
+  checked: number;
+  refired: { cell_id: number; instance_id: string }[];
+  errors: { cell_id: number; error: string }[];
+}
+
+export async function sweepPendingCells(env: Env): Promise<PendingSweepResult> {
+  const stuck = await findStuckPendingCells(env, 10);
+  const refired: { cell_id: number; instance_id: string }[] = [];
+  const errors: { cell_id: number; error: string }[] = [];
+
+  for (const cell of stuck) {
+    try {
+      const instance = await env.CODE_CELL_WORKFLOW.create({
+        params: { cell_id: cell.id, spec: cell.spec, execution_mode: cell.execution_mode },
+      });
+      refired.push({ cell_id: cell.id, instance_id: instance.id });
+    } catch (e: any) {
+      errors.push({ cell_id: cell.id, error: String(e?.message ?? e).slice(0, 500) });
+    }
+  }
+
+  return { checked: stuck.length, refired, errors };
 }
 
 export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowParams> {
