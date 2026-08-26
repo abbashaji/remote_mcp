@@ -38,30 +38,37 @@
 // itself (Workflows' own step-retry behavior applies), unlike a PostHog
 // trend-data hiccup, which must never block anything.
 //
-// Section 4g addendum: OpenHands (open-source, model-agnostic autonomous
-// coding agent) as a SECOND generation front-end, alongside the Fast
-// Worker cascade above -- not a patch layered on top of it, and not a
-// wholesale replacement of this file's own retry/tag/notify wiring.
-// Where this pipeline's own hand-built machinery is doing something
-// genuinely valuable (rate-limit-aware pacing across instances, the
-// deterministic Heavy Worker test as the actual pass/fail authority,
-// tagging/notify/checkpoint discipline, Section 3b's judgment boundary),
-// none of that changes. Where the JOB is "iterate on this code until it
-// works," OpenHands' own maintained plan->write->run->iterate loop is a
-// more capable version of what generateCode() does in one shot -- so it
-// slots in as an alternate front-end for THAT specific job only, then
-// hands off to the exact same Heavy Worker / tag-result / notify tail
-// every other cell already goes through. See runGenerateTestTagCycle()
-// below for the shared tail, and CodeCellWorkflow.run() for the two ways
-// into it: execution_mode='openhands' set at cell_create time, or a
-// 'pipeline' cell's first test failure auto-escalating to one OpenHands
-// attempt before falling to Failed/Debugger. Either way OpenHands never
-// decides a cell's status itself -- Heavy Worker's test result, run the
-// same way regardless of which front-end produced the code, still does
-// that. This is the same non-overlap discipline Section 4a already
-// applies to Antigravity's (currently unwired) fix-attempt concept and
-// Section 4c applies to tagging: a more capable tool gets to try, never
-// to self-certify.
+// Section 4g addendum: Aider (https://aider.chat -- open-source,
+// model-agnostic autonomous coding agent) as a SECOND generation
+// front-end, alongside the Fast Worker cascade above -- not a patch
+// layered on top of it, and not a wholesale replacement of this file's
+// own retry/tag/notify wiring. Where this pipeline's own hand-built
+// machinery is doing something genuinely valuable (rate-limit-aware
+// pacing across instances, the deterministic Heavy Worker test as the
+// actual pass/fail authority, tagging/notify/checkpoint discipline,
+// Section 3b's judgment boundary), none of that changes. Where the JOB
+// is "iterate on this code until it works," Aider's own maintained
+// plan->write->run->iterate loop is a more capable version of what
+// generateCode() does in one shot -- so it slots in as an alternate
+// front-end for THAT specific job only, then hands off to the exact
+// same Heavy Worker / tag-result / notify tail every other cell already
+// goes through. See runGenerateTestTagCycle() below for the shared
+// tail, and CodeCellWorkflow.run() for the two ways into it:
+// execution_mode='aider' set at cell_create time, or a 'pipeline'
+// cell's first test failure auto-escalating to one Aider attempt before
+// falling to Failed/Debugger. Either way Aider never decides a cell's
+// status itself -- Heavy Worker's test result, run the same way
+// regardless of which front-end produced the code, still does that.
+// This is the same non-overlap discipline Section 4a already applies to
+// Antigravity's (currently unwired) fix-attempt concept and Section 4c
+// applies to tagging: a more capable tool gets to try, never to
+// self-certify.
+//
+// (This lane originally ran OpenHands; it was swapped to Aider after
+// OpenHands' CLI proved unusable under this project's zero-cost token
+// budget -- see aider-run.yml's header comment for the full story. The
+// generator/event/env-var naming below was renamed from openhands_* to
+// aider_* to match; there is no OpenHands code left in this file.)
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { Env } from "./index";
@@ -76,7 +83,7 @@ import { postHogCaptureException, postHogCaptureCodeCellResolution } from "./pos
 export interface CodeCellWorkflowParams {
   cell_id: number;
   spec: string;
-  execution_mode?: string; // 'pipeline' (default) | 'openhands' -- Section 4g
+  execution_mode?: string; // 'pipeline' (default) | 'aider' -- Section 4g
 }
 
 interface HeavyWorkerResult {
@@ -91,10 +98,10 @@ export interface FastWorkerDraft {
 
 export type FastWorkerEventPayload = FastWorkerDraft | { error: string };
 
-// Section 4g: what /webhook/openhands-result (auth.ts) forwards. run_id
+// Section 4g: what /webhook/aider-result (auth.ts) forwards. run_id
 // travels on both branches so it's captured even on a failed run (useful
 // for pulling logs afterward), not just a successful one.
-export type OpenHandsResultPayload =
+export type AiderResultPayload =
   | { code: string; run_id?: string }
   | { error: string; run_id?: string };
 
@@ -194,8 +201,8 @@ async function classifyFailure(env: Env, log: string): Promise<{ tag: "known_fla
 // Section 4/10: classify a Heavy Worker test result and record it --
 // Turso status/tag/retry_count, PostHog resolution capture. Extracted
 // as a standalone function (Section 4g) so BOTH the primary
-// generate-test cycle and an OpenHands escalation cycle can call the
-// exact same classification/recording logic rather than maintaining two
+// generate-test cycle and an Aider escalation cycle can call the exact
+// same classification/recording logic rather than maintaining two
 // copies -- the provider that produced the code is the only thing that
 // varies between callers.
 // ---------------------------------------------------------------------
@@ -323,7 +330,7 @@ function requireWorkerUrl(env: Env): string {
   if (!env.WORKER_URL) {
     throw new Error(
       "WORKER_URL is not configured on this Worker (needed so fast-worker-generate can publish a QStash " +
-        "message back to this same Worker's own /qstash/fast-worker-generate route, and so the OpenHands " +
+        "message back to this same Worker's own /qstash/fast-worker-generate route, and so the Aider " +
         "generation lane knows where to POST its result). Set it in wrangler.toml's [vars] block to this " +
         "Worker's own https://....workers.dev base URL.",
     );
@@ -341,31 +348,30 @@ function requireFastWorkerCallbackToken(env: Env): string {
   return env.FAST_WORKER_CALLBACK_TOKEN;
 }
 
-function requireOpenHandsCallbackToken(env: Env): string {
-  if (!env.OPENHANDS_CALLBACK_TOKEN) {
+function requireAiderCallbackToken(env: Env): string {
+  if (!env.AIDER_CALLBACK_TOKEN) {
     throw new Error(
-      "OPENHANDS_CALLBACK_TOKEN is not configured on this Worker. Run: wrangler secret put OPENHANDS_CALLBACK_TOKEN " +
+      "AIDER_CALLBACK_TOKEN is not configured on this Worker. Run: wrangler secret put AIDER_CALLBACK_TOKEN " +
         "(a random secret, e.g. `openssl rand -hex 32`). Also set the SAME value as a repo secret named " +
-        "OPENHANDS_CALLBACK_TOKEN on whichever repo runs openhands-run.yml -- that job forwards it as a " +
-        "bearer token when it POSTs back to /webhook/openhands-result (auth.ts).",
+        "AIDER_CALLBACK_TOKEN on whichever repo runs aider-run.yml -- that job forwards it as a " +
+        "bearer token when it POSTs back to /webhook/aider-result (auth.ts).",
     );
   }
-  return env.OPENHANDS_CALLBACK_TOKEN;
+  return env.AIDER_CALLBACK_TOKEN;
 }
 
-// Section 4g: the repo containing .github/workflows/openhands-run.yml.
+// Section 4g: the repo containing .github/workflows/aider-run.yml.
 // Deliberately falls back to HEAVY_WORKER_REPO rather than requiring a
 // separate secret in the common case -- both workflows want the same
 // "public repo, unmetered runners" property, and this project already
 // has exactly one such repo (abbashaji/ondine). Override with
-// OPENHANDS_REPO only if OpenHands' workflow file should live somewhere
-// else.
-function resolveOpenHandsRepo(env: Env): string {
-  const repo = env.OPENHANDS_REPO || env.HEAVY_WORKER_REPO;
+// AIDER_REPO only if Aider's workflow file should live somewhere else.
+function resolveAiderRepo(env: Env): string {
+  const repo = env.AIDER_REPO || env.HEAVY_WORKER_REPO;
   if (!repo) {
     throw new Error(
-      "Neither OPENHANDS_REPO nor HEAVY_WORKER_REPO is set on this Worker -- need a repo containing " +
-        ".github/workflows/openhands-run.yml.",
+      "Neither AIDER_REPO nor HEAVY_WORKER_REPO is set on this Worker -- need a repo containing " +
+        ".github/workflows/aider-run.yml.",
     );
   }
   return repo;
@@ -375,7 +381,7 @@ function resolveOpenHandsRepo(env: Env): string {
 // Section 4g: shared generate -> persist -> test -> tag cycle. Two
 // callers use this: the primary attempt (generator matches whatever
 // execution_mode the cell was created with) and, for a 'pipeline' cell
-// whose primary attempt's test failed, a single OpenHands escalation
+// whose primary attempt's test failed, a single Aider escalation
 // attempt. `label` disambiguates step/event names between the two calls
 // on the same Workflow instance -- Cloudflare Workflows step identity is
 // per-name, and both calls can occur sequentially within one run() (see
@@ -392,17 +398,17 @@ async function runGenerateTestTagCycle(
   cellId: number,
   spec: string,
   instanceId: string,
-  generator: "pipeline" | "openhands",
+  generator: "pipeline" | "aider",
   label: "primary" | "escalation",
 ): Promise<{ tag: string; provider: string }> {
   let draft: FastWorkerDraft;
 
-  if (generator === "openhands") {
-    await step.do(`openhands-generate-dispatch-${label}`, async () => {
+  if (generator === "aider") {
+    await step.do(`aider-generate-dispatch-${label}`, async () => {
       await updateCell(env, cellId, { status: "Processing_Drafting" });
       const workerUrl = requireWorkerUrl(env);
-      requireOpenHandsCallbackToken(env); // presence check only -- the token itself lives as a repo secret, see openhands-run.yml
-      const repo = resolveOpenHandsRepo(env);
+      requireAiderCallbackToken(env); // presence check only -- the token itself lives as a repo secret, see aider-run.yml
+      const repo = resolveAiderRepo(env);
 
       let task = spec;
       if (label === "escalation") {
@@ -417,27 +423,27 @@ async function runGenerateTestTagCycle(
         cell_id: String(cellId),
         workflow_instance_id: instanceId,
         task,
-        callback_url: `${workerUrl}/webhook/openhands-result`,
+        callback_url: `${workerUrl}/webhook/aider-result`,
       });
       if (result.startsWith("Failed to trigger")) throw new Error(result);
     });
 
-    const ohEvent = await step.waitForEvent<OpenHandsResultPayload>(`openhands-generate-wait-${label}`, {
-      type: "openhands-result",
+    const aiderEvent = await step.waitForEvent<AiderResultPayload>(`aider-generate-wait-${label}`, {
+      type: "aider-result",
       timeout: "60 minutes",
     });
 
-    await step.do(`record-openhands-run-${label}`, async () => {
+    await step.do(`record-aider-run-${label}`, async () => {
       await updateCell(env, cellId, {
-        openhands_run_id: ohEvent.payload.run_id ?? null,
-        openhands_result: "error" in ohEvent.payload ? `${label}_error` : `${label}_generated`,
+        aider_run_id: aiderEvent.payload.run_id ?? null,
+        aider_result: "error" in aiderEvent.payload ? `${label}_error` : `${label}_generated`,
       });
     });
 
-    if ("error" in ohEvent.payload) {
-      throw new Error(`OpenHands generation failed: ${ohEvent.payload.error}`);
+    if ("error" in aiderEvent.payload) {
+      throw new Error(`Aider generation failed: ${aiderEvent.payload.error}`);
     }
-    draft = { code: ohEvent.payload.code, provider: "openhands" };
+    draft = { code: aiderEvent.payload.code, provider: "aider" };
   } else {
     await step.do(`fast-worker-dispatch-${label}`, async () => {
       const workerUrl = requireWorkerUrl(env);
@@ -506,29 +512,29 @@ export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowPa
   async run(event: WorkflowEvent<CodeCellWorkflowParams>, step: WorkflowStep) {
     const { cell_id, spec, execution_mode } = event.payload;
     const instanceId = (event as any).instanceId as string;
-    const mode: "pipeline" | "openhands" = execution_mode === "openhands" ? "openhands" : "pipeline";
+    const mode: "pipeline" | "aider" = execution_mode === "aider" ? "aider" : "pipeline";
 
     try {
       let { tag } = await runGenerateTestTagCycle(this.env, step, cell_id, spec, instanceId, mode, "primary");
 
       // Section 4g auto-escalation. Deliberately NOT a judgment call
-      // about whether this task "looks OpenHands-shaped" -- that kind of
+      // about whether this task "looks Aider-shaped" -- that kind of
       // a-priori fit guess is exactly the sort of thing Section 3b keeps
       // off Layer 0. This is a mechanical, outcome-triggered rule
       // instead: a 'pipeline' cell whose primary attempt actually failed
       // its test (not a malformed-spec Dead_Letter -- that's an
       // Architect problem a longer autonomous loop can't fix either)
-      // gets exactly one OpenHands turn before settling to Failed and
-      // waiting for a Debugger, gated by openhands_attempted so it can
+      // gets exactly one Aider turn before settling to Failed and
+      // waiting for a Debugger, gated by aider_attempted so it can
       // never fire twice on the same cell.
       if (mode === "pipeline" && tag !== "passed" && tag !== "dead_letter") {
-        const cell = await step.do("check-openhands-escalation-eligibility", async () => getCell(this.env, cell_id));
-        const eligible = !!cell && !cell.openhands_attempted && cell.status === "Failed";
+        const cell = await step.do("check-aider-escalation-eligibility", async () => getCell(this.env, cell_id));
+        const eligible = !!cell && !cell.aider_attempted && cell.status === "Failed";
         if (eligible) {
-          await step.do("mark-openhands-attempted", async () => {
-            await updateCell(this.env, cell_id, { openhands_attempted: true });
+          await step.do("mark-aider-attempted", async () => {
+            await updateCell(this.env, cell_id, { aider_attempted: true });
           });
-          const escalated = await runGenerateTestTagCycle(this.env, step, cell_id, spec, instanceId, "openhands", "escalation");
+          const escalated = await runGenerateTestTagCycle(this.env, step, cell_id, spec, instanceId, "aider", "escalation");
           tag = escalated.tag;
         }
       }
@@ -544,11 +550,11 @@ export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowPa
     } catch (err: any) {
       // Terminal failure -- retry budget exhausted, the Fast Worker
       // dispatch itself failed (all providers exhausted, or QStash
-      // couldn't deliver), the OpenHands generation lane errored or
+      // couldn't deliver), the Aider generation lane errored or
       // timed out, or the Heavy Worker never called back before the
       // 30-minute timeout. Section 4a's Dead_Letter path, expressed as
       // this Workflow's own error handling -- unchanged by Section 4g,
-      // since an OpenHands failure surfaces the same way any other
+      // since an Aider failure surfaces the same way any other
       // generation-lane failure always has.
       await step.do("dead-letter", async () => {
         const message = String(err?.message ?? err).slice(0, 4000);
