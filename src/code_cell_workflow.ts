@@ -79,6 +79,7 @@ import { sendWebPushToAll } from "./push";
 import { qstashPublish } from "./qstash";
 import { updateCell, getCell, findStuckPendingCells } from "./codecells";
 import { postHogCaptureException, postHogCaptureCodeCellResolution } from "./posthog_events";
+import { recordCycleItem, sweepStaleReviewCycle, type CycleCloseResult } from "./review_cycles";
 
 export interface CodeCellWorkflowParams {
   cell_id: number;
@@ -225,6 +226,16 @@ async function classifyAndRecordResult(
       }
     } catch (e) {
       console.error(`PostHog resolution capture threw unexpectedly for CodeCell #${cellId} (non-blocking): ${e}`);
+    }
+    // Section 3b/10a real cycle infrastructure (review_cycles.ts): the
+    // same `escalated` value feeds the current batch's escalation_count
+    // in Turso, not just this cell's own PostHog event. Best-effort,
+    // same rationale as the PostHog capture immediately above -- a
+    // cycle-accounting hiccup must never block a CodeCell's resolution.
+    try {
+      await recordCycleItem(env, escalated);
+    } catch (e) {
+      console.error(`Review-cycle accounting failed for CodeCell #${cellId} (non-blocking): ${e}`);
     }
   };
 
@@ -533,6 +544,14 @@ export interface PendingSweepResult {
   checked: number;
   refired: { cell_id: number; instance_id: string }[];
   errors: { cell_id: number; error: string }[];
+  // Section 3b/10a: the age-based half of a cycle's mechanical close
+  // condition (review_cycles.ts's CYCLE_MAX_AGE_HOURS) has nothing to
+  // trigger it if no CodeCell resolves for a while -- piggybacked onto
+  // this same low-frequency backstop cron rather than adding a second
+  // Section-2 schedule. `null` means the open cycle wasn't stale (or
+  // was empty) this tick, which is the normal/expected case most ticks.
+  staleCycleClosed: CycleCloseResult | null;
+  staleCycleError: string | null;
 }
 
 export async function sweepPendingCells(env: Env): Promise<PendingSweepResult> {
@@ -551,7 +570,15 @@ export async function sweepPendingCells(env: Env): Promise<PendingSweepResult> {
     }
   }
 
-  return { checked: stuck.length, refired, errors };
+  let staleCycleClosed: CycleCloseResult | null = null;
+  let staleCycleError: string | null = null;
+  try {
+    staleCycleClosed = await sweepStaleReviewCycle(env);
+  } catch (e: any) {
+    staleCycleError = String(e?.message ?? e).slice(0, 500);
+  }
+
+  return { checked: stuck.length, refired, errors, staleCycleClosed, staleCycleError };
 }
 
 export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowParams> {
