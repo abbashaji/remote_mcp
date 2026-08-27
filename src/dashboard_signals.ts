@@ -132,14 +132,16 @@ async function stalledWork(env: TursoEnv): Promise<HealthSignal> {
 }
 
 // ---- Silent pipeline stalls (Section 4a's stuck-Pending backstop) ------
-// This codebase does not implement Section 4a's backstop cron as of this
-// cell -- no /webhook/pending-sweep (or equivalent) route exists in
-// auth.ts, and no matching QStash schedule exists on this account (see
-// this cell's summary). Checked at runtime, not assumed: this queries
-// QStash's actual schedule list and looks for one whose destination
-// looks like a Pending-sweep backstop, so if that route+schedule get
-// added later this signal lights up automatically without code changes
-// here, per the cell prompt's defensive-build rule.
+// Section 4a's backstop cron is implemented: /webhook/pending-sweep
+// (auth.ts) queries findStuckPendingCells (codecells.ts) and re-fires a
+// CodeCellWorkflow instance for anything genuinely orphaned, wired to a
+// */10 * * * * QStash schedule targeting that route. This function
+// doesn't assume that, though -- it queries QStash's actual schedule
+// list at runtime and looks for a destination that looks like a
+// Pending-sweep backstop, so if the route or schedule ever gets removed
+// or renamed, this signal reflects that immediately rather than staying
+// stuck reporting "configured" against infrastructure that's since
+// disappeared.
 
 async function silentPipelineStalls(env: QstashEnv): Promise<HealthSignal> {
   const key = "silent_pipeline_stalls";
