@@ -59,21 +59,40 @@
 // falling to Failed/Debugger. Either way Aider never decides a cell's
 // status itself -- Heavy Worker's test result, run the same way
 // regardless of which front-end produced the code, still does that.
-// This is the same non-overlap discipline Section 4a already applies to
-// Antigravity's (currently unwired) fix-attempt concept and Section 4c
-// applies to tagging: a more capable tool gets to try, never to
-// self-certify.
+// This is the same non-overlap discipline Section 4c applies to
+// tagging: a more capable tool gets to try, never to self-certify.
 //
 // (This lane originally ran OpenHands; it was swapped to Aider after
 // OpenHands' CLI proved unusable under this project's zero-cost token
 // budget -- see aider-run.yml's header comment for the full story. The
 // generator/event/env-var naming below was renamed from openhands_* to
 // aider_* to match; there is no OpenHands code left in this file.)
+//
+// Section 4a/4f addendum: the Antigravity fix-attempt layer is now
+// wired -- antigravity.ts already had the Gemini Interactions API
+// client and the antigravity_run/antigravity_get_interaction MCP tools
+// existed for manual use, but neither was ever called from this file.
+// It sits as its own step.do("antigravity-fix-attempt", ...) between a
+// failed heavy-worker-test and the Failed/Dead_Letter path, exactly as
+// Section 4f describes: a single bounded patch attempt on the code
+// that's ALREADY there, gated by antigravity_attempted (codecells.ts)
+// so it fires at most once per cell, regardless of execution_mode.
+// Deliberately tried BEFORE Section 4g's Aider auto-escalation, not
+// after and not instead of it -- Antigravity is the cheaper/faster
+// "competent intern" pass Section 4a describes, Aider is the heavier
+// "iterate until it works" regeneration loop; if Antigravity's patch
+// doesn't make the retest pass, the cell falls through to the existing
+// Aider-eligibility check unchanged. Same non-overlap rule as Aider
+// above: Antigravity drafts a patch, it never marks a cell Completed or
+// Dead_Letter itself -- the Heavy Worker retest and
+// classifyAndRecordResult() remain the only authority for that. See
+// attemptAntigravityFix() and CodeCellWorkflow.run() below.
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { Env } from "./index";
 import { groqChatCompletion } from "./groq";
 import { geminiGenerateContent } from "./gemini";
+import { antigravityRunInteraction } from "./antigravity";
 import { githubTriggerWorkflow } from "./github";
 import { sendWebPushToAll } from "./push";
 import { qstashPublish } from "./qstash";
@@ -196,6 +215,64 @@ async function classifyFailure(env: Env, log: string): Promise<{ tag: "known_fla
   // Non-overlap rule (4c): a tagging failure defaults to needs_human,
   // never to silently suppressing an alert.
   return { tag: "needs_human", reason: "classification unavailable, defaulting to human review" };
+}
+
+// ---------------------------------------------------------------------
+// Section 4a/4f: Antigravity's bounded fix-attempt layer. A single call
+// to the managed Antigravity agent (antigravity.ts), given the failing
+// cell's current code and the Heavy Worker's failure log, asked to
+// return ONLY the corrected file's complete code in a fenced block --
+// same extractCode() convention Section 4b's Fast Worker cascade
+// already uses, so a stray "Here's the fix..." preamble can't leak into
+// the code column. Bounded per Section 4a's "no multi-file refactors,
+// no spec reinterpretation" scope (the prompt says so explicitly) and a
+// maxTotalTokens cap. This function does no retry/fallback of its own
+// if Antigravity declines or the sandbox errors -- a null return here
+// is a normal, expected outcome (not every Failed cell is an
+// intern-fixable one), and the caller falls through to the existing
+// Failed/Aider path exactly as if Antigravity had never been tried.
+// ---------------------------------------------------------------------
+const ANTIGRAVITY_FIX_INSTRUCTION =
+  "Attempt a single bounded fix to the code above based on the failure log -- " +
+  "no multi-file refactors, no reinterpreting the original spec, no adding " +
+  "features. If you cannot identify a confident, narrow fix, respond with " +
+  "exactly NO_FIX and nothing else. Otherwise respond with ONLY the corrected " +
+  "file's complete code in a single fenced code block (``` ... ```). No " +
+  "preamble, no explanation, no commentary before or after the block -- the " +
+  "block's contents replace the file's contents as-is.";
+
+async function attemptAntigravityFix(env: Env, code: string, log: string): Promise<{ code: string } | null> {
+  const prompt =
+    `The code below failed its Heavy Worker test run.\n\n` +
+    `Current code:\n\`\`\`\n${code}\n\`\`\`\n\n` +
+    `Test failure log:\n${log.slice(0, 4000)}\n\n${ANTIGRAVITY_FIX_INSTRUCTION}`;
+
+  const raw = await antigravityRunInteraction(env, prompt, {
+    // Cheaper/faster tier for a bounded patch pass -- same rationale
+    // Section 4b uses tiered Flash-Lite models for, not the full model
+    // by default.
+    model: "gemini-3.5-flash-lite",
+    maxTotalTokens: 60000,
+  });
+  if (raw.startsWith("Error ")) return null;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed?.status !== "completed" || typeof parsed?.output_text !== "string") return null;
+
+  const outputText = parsed.output_text.trim();
+  if (outputText === "NO_FIX" || outputText.length === 0) return null;
+
+  const fixed = extractCode(outputText);
+  // A "fix" that's byte-identical to what's already there isn't worth
+  // spending a Heavy Worker retest on -- same as producing no fix at all.
+  if (!fixed || fixed.trim() === code.trim()) return null;
+
+  return { code: fixed };
 }
 
 // ---------------------------------------------------------------------
@@ -521,6 +598,60 @@ async function runGenerateTestTagCycle(
 }
 
 // ---------------------------------------------------------------------
+// Section 4a/4f: re-test an Antigravity patch through the SAME Heavy
+// Worker dispatch / classifyAndRecordResult path every other cell's
+// code goes through -- Antigravity drafts, it never self-certifies.
+// Deliberately not folded into runGenerateTestTagCycle() above: there's
+// no generation step here (the code already exists, patched in place),
+// and this only ever runs once per cell (gated by antigravity_attempted
+// in the caller), so the label-suffix machinery that function needs for
+// its primary/escalation double-call doesn't apply here.
+// ---------------------------------------------------------------------
+async function runAntigravityRetestAndTag(
+  env: Env,
+  step: WorkflowStep,
+  cellId: number,
+  instanceId: string,
+  patchedCode: string,
+): Promise<string> {
+  await step.do("antigravity-persist-code-ready", async () => {
+    await updateCell(env, cellId, { status: "Code_Ready", code: patchedCode, provider: "antigravity" });
+  });
+
+  await step.do("antigravity-heavy-worker-dispatch", async () => {
+    await updateCell(env, cellId, { status: "Testing" });
+    const result = await githubTriggerWorkflow(env.GITHUB_TOKEN!, env.HEAVY_WORKER_REPO!, "test.yml", "main", {
+      cell_id: String(cellId),
+      workflow_instance_id: String(instanceId),
+    });
+    if (result.startsWith("Failed to trigger")) throw new Error(result);
+  });
+
+  // Same durable-wait pattern as the primary/escalation cycles -- and
+  // the SAME event type/route (auth.ts's /webhook/heavy-worker-result),
+  // since only one Heavy Worker wait is ever active on an instance at a
+  // given time.
+  const testEvent = await step.waitForEvent<HeavyWorkerResult>("antigravity-heavy-worker-wait", {
+    type: "heavy-worker-result",
+    timeout: "30 minutes",
+  });
+
+  const tag = await step.do("antigravity-tag-result", async () =>
+    classifyAndRecordResult(env, cellId, testEvent.payload, "antigravity"),
+  );
+
+  // Refine antigravity_result from the caller's provisional "fix_produced"
+  // to the actual retest outcome, so a Reviewer session can tell "produced
+  // a patch that passed" apart from "produced a patch, still failed" --
+  // see the column's comment in codecells.ts.
+  await step.do("antigravity-record-outcome", async () => {
+    await updateCell(env, cellId, { antigravity_result: tag === "passed" ? "fix_passed" : "fix_failed_retest" });
+  });
+
+  return tag;
+}
+
+// ---------------------------------------------------------------------
 // Section 4a's stuck-`Pending` backstop. Wired to a low-frequency QStash
 // schedule hitting /webhook/pending-sweep (auth.ts), same shape as
 // Section 7d/7f's embedding-backfill/keepalive cron pair -- a
@@ -589,6 +720,37 @@ export class CodeCellWorkflow extends WorkflowEntrypoint<Env, CodeCellWorkflowPa
 
     try {
       let { tag } = await runGenerateTestTagCycle(this.env, step, cell_id, spec, instanceId, mode, "primary");
+
+      // Section 4a/4f: Antigravity's bounded fix-attempt layer, tried on
+      // ANY Failed cell -- regardless of execution_mode -- before
+      // Section 4g's heavier Aider auto-escalation below. Skipped on
+      // dead_letter for the same reason Aider's escalation is: a
+      // malformed-spec Dead_Letter is an Architect problem, not
+      // something a bounded autonomous patch (or a longer autonomous
+      // loop) can fix either. Gated by antigravity_attempted so it can
+      // never fire twice on the same cell, mirroring aider_attempted.
+      if (tag !== "passed" && tag !== "dead_letter") {
+        const antigravityAttempt = await step.do(
+          "antigravity-fix-attempt",
+          { timeout: "5 minutes", retries: { limit: 1, delay: "10 seconds", backoff: "constant" } },
+          async () => {
+            const cell = await getCell(this.env, cell_id);
+            if (!cell || cell.antigravity_attempted || !cell.code) {
+              return { produced: false as const };
+            }
+            const fix = await attemptAntigravityFix(this.env, cell.code, cell.last_error ?? "");
+            await updateCell(this.env, cell_id, {
+              antigravity_attempted: true,
+              antigravity_result: fix ? "fix_produced" : "no_fix_produced",
+            });
+            return fix ? { produced: true as const, code: fix.code } : { produced: false as const };
+          },
+        );
+
+        if (antigravityAttempt.produced) {
+          tag = await runAntigravityRetestAndTag(this.env, step, cell_id, instanceId, antigravityAttempt.code);
+        }
+      }
 
       // Section 4g auto-escalation. Deliberately NOT a judgment call
       // about whether this task "looks Aider-shaped" -- that kind of
