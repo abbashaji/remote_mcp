@@ -68,6 +68,7 @@ export async function ensureSchema(env: TursoEnv): Promise<void> {
   // TABLEs, swallowing "column already exists" specifically.
   await ensureArtifactColumns(client);
   await ensureAiderColumns(client);
+  await ensureAntigravityColumns(client);
 }
 
 async function ensureArtifactColumns(client: Client): Promise<void> {
@@ -129,6 +130,40 @@ async function ensureAiderColumns(client: Client): Promise<void> {
   }
 }
 
+// Section 4a/4f: Antigravity's bounded fix-attempt layer. Sits between a
+// failed heavy-worker-test and the Failed/Dead_Letter path -- a cheaper,
+// faster "competent intern" pass at patching the code that's ALREADY
+// there, tried before (and independent of) Section 4g's heavier Aider
+// full-regeneration escalation. Same one-shot-per-cell discipline as
+// aider_attempted, and deliberately its own gate rather than reusing
+// aider_attempted -- a cell can get one Antigravity patch attempt AND,
+// if that still fails, one Aider escalation, since they're different
+// tools attempting different jobs (patch vs. regenerate).
+//
+//   antigravity_attempted -- guard rail: Antigravity gets at most ONE
+//                             fix-attempt per cell, regardless of
+//                             execution_mode. Never reset.
+//   antigravity_result     -- short outcome summary ('no_fix_produced',
+//                             'fix_failed_retest', 'fix_passed', or an
+//                             error string) distinct from the generic
+//                             `tag`/`last_error` fields, so a Reviewer
+//                             session can tell "Antigravity patched it
+//                             and that passed/failed" apart from a
+//                             plain single-shot Fast Worker/Aider outcome.
+async function ensureAntigravityColumns(client: Client): Promise<void> {
+  const alters = [
+    `ALTER TABLE code_cells ADD COLUMN antigravity_attempted INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE code_cells ADD COLUMN antigravity_result TEXT`,
+  ];
+  for (const sql of alters) {
+    try {
+      await client.execute(sql);
+    } catch (e) {
+      if (!String(e).toLowerCase().includes("duplicate column")) throw e;
+    }
+  }
+}
+
 export interface CellRow {
   id: number;
   status: string;
@@ -144,6 +179,8 @@ export interface CellRow {
   aider_attempted: number;
   aider_run_id: string | null;
   aider_result: string | null;
+  antigravity_attempted: number;
+  antigravity_result: string | null;
 }
 
 export async function createCell(
@@ -174,6 +211,8 @@ export async function updateCell(
     aider_attempted: boolean;
     aider_run_id: string | null;
     aider_result: string | null;
+    antigravity_attempted: boolean;
+    antigravity_result: string | null;
   }>,
 ): Promise<void> {
   const client = getWorkflowClient(env);
