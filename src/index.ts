@@ -35,7 +35,7 @@ import * as ag from "./antigravity";
 import { AuthHandler } from "./auth";
 import { JobWorkflow } from "./workflows";
 import { TaskRunner, type RunnerTask } from "./runner";
-import { CodeCellWorkflow } from "./code_cell_workflow";
+import { CodeCellWorkflow, sweepPendingCells } from "./code_cell_workflow";
 import { DashboardHub } from "./dashboard_do";
 import { ensureSchema, createCell, resumeCandidate, writeCheckpoint, getCell } from "./codecells";
 
@@ -84,6 +84,7 @@ export interface Env {
   AIDER_REPO?: string; // Section 4g: optional, "owner/name" of the repo containing .github/workflows/aider-run.yml -- defaults to HEAVY_WORKER_REPO if unset, see code_cell_workflow.ts
   GITHUB_RELEASE_ARTIFACTS_REPO?: string; // optional, defaults to "abbashaji/remote_mcp" -- see github_release.ts
   GRAPH_CRON_TOKEN?: string; // machine-to-machine secret for /webhook/graph-embedding-backfill and /webhook/graph-heartbeat (Section 7d, 7f)
+  PENDING_SWEEP_TOKEN?: string; // Section 4a: machine-to-machine secret for /webhook/pending-sweep, deliberately its own secret rather than reusing GRAPH_CRON_TOKEN -- same "nothing external needs to know this value" reasoning auth.ts already documents for FAST_WORKER_CALLBACK_TOKEN vs HEAVY_WORKER_CALLBACK_TOKEN
   B2_KEY_ID?: string; // Backblaze B2 S3-compatible application key id -- see b2.ts
   B2_APPLICATION_KEY?: string; // Backblaze B2 S3-compatible application key secret -- see b2.ts
   B2_BUCKET_NAME?: string; // Backblaze B2 bucket name -- see b2.ts
@@ -750,6 +751,28 @@ function buildServer(env: Env): McpServer {
         return text(JSON.stringify(result, null, 2));
       } catch (e) {
         return text(`Error touching heartbeat: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "pending_sweep",
+    {
+      description:
+        "Section 4a's manual trigger for the stuck-`Pending` backstop (the same logic the QStash schedule " +
+        "at /webhook/pending-sweep runs automatically every 10 minutes) -- finds CodeCells that have sat " +
+        "in `Pending` for over 10 minutes (meaning their CodeCellWorkflow instance never actually started " +
+        "at cell_create time) and starts it now. Safe to call anytime: cells that are merely queued behind " +
+        "real work, or that already have a workflow instance running, won't match the query in the first " +
+        "place -- see codecells.ts's findStuckPendingCells for why.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const result = await sweepPendingCells(env);
+        return text(JSON.stringify(result, null, 2));
+      } catch (e) {
+        return text(`Error sweeping stuck-Pending cells: ${e}`);
       }
     },
   );
