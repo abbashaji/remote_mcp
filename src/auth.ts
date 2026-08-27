@@ -319,6 +319,13 @@ export const AuthHandler = {
     // CodeCellWorkflow instance that should have started at cell_create
     // time and never did. Wired to a low-frequency QStash schedule --
     // see this repo's deploy notes for the actual cron in use.
+    //
+    // Also closes a stale open review cycle (Section 3b/10a --
+    // review_cycles.ts's sweepStaleReviewCycle, called inside
+    // sweepPendingCells below) on the same tick -- the age-based half of
+    // a cycle's close condition has nothing else to trigger it if no
+    // CodeCell resolves for a while, so it rides this existing
+    // low-frequency cron rather than getting a second one.
     if (url.pathname === "/webhook/pending-sweep" && request.method === "POST") {
       const authError = checkPendingSweepAuth(request, env);
       if (authError) return authError;
