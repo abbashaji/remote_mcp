@@ -172,23 +172,49 @@ export async function postHogCaptureCodeCellResolution(
   env: PostHogEventsEnv,
   args: { cellId: number; tag: string; escalated: boolean; provider?: string },
 ): Promise<string> {
-  // Section 10a: an approximation of "skipped-cycle rate," at CodeCell
-  // granularity rather than Section 3b's actual "cycle" (a batch of N
-  // cells a Reviewer/Architect session reviews together) -- that
-  // batching concept doesn't exist as implemented infrastructure
-  // anywhere in this codebase yet (the pipeline is CodeCell-centric,
-  // not cycle-centric). `escalated` uses "resolved via automatic
-  // tagging alone (passed / known_flake_pattern) vs. needing a human
-  // (needs_human / dead_letter)" as a rough, honest proxy for "no
-  // Context Slot involvement was needed" -- NOT a literal
-  // implementation of Section 3b's cycle concept. See this cell's
-  // summary for the same caveat spelled out for a human reader, and
-  // code_cell_workflow.ts's tag-result step for where this is called.
+  // Per-CodeCell resolution record. `escalated` ("resolved via automatic
+  // tagging alone -- passed / known_flake_pattern -- vs. needing a human
+  // -- needs_human / dead_letter") is Section 3b's escalation test
+  // applied at cell granularity -- the correct INPUT to a cycle's
+  // aggregate, per review_cycles.ts's header comment, but not itself a
+  // "skipped-cycle rate": that's a property of a batch of cells, not any
+  // one cell. See postHogCaptureReviewCycle below and review_cycles.ts
+  // for the actual Section 3b/10a cycle infrastructure now built on top
+  // of this per-cell signal -- code_cell_workflow.ts's tag-result step
+  // calls both, in the same place, from the same `escalated` value.
   return captureEvent(env, "codecell_resolution", `codecell-${args.cellId}`, {
     cell_id: args.cellId,
     tag: args.tag,
     escalated: args.escalated,
     provider: args.provider ?? null,
     source: "code_cell_workflow",
+  });
+}
+
+// Section 10a: the real cycle-close event, one per row written to
+// Turso's review_cycles table (review_cycles.ts). Distinct distinct_id
+// scheme from the per-cell events above (`review-cycle-N`, not
+// `codecell-N`) so PostHog's per-event trend/funnel tooling treats a
+// cycle as its own entity rather than accidentally folding cycle-level
+// counts into a CodeCell's own event timeline.
+export async function postHogCaptureReviewCycle(
+  env: PostHogEventsEnv,
+  args: {
+    cycleId: number;
+    itemCount: number;
+    escalationCount: number;
+    contextSlotTriggered: boolean;
+    triggerReason: "escalation" | "floor" | null;
+    closeReason: "batch_size" | "max_age";
+  },
+): Promise<string> {
+  return captureEvent(env, "review_cycle_closed", `review-cycle-${args.cycleId}`, {
+    cycle_id: args.cycleId,
+    item_count: args.itemCount,
+    escalation_count: args.escalationCount,
+    context_slot_triggered: args.contextSlotTriggered,
+    trigger_reason: args.triggerReason,
+    close_reason: args.closeReason,
+    source: "review_cycles",
   });
 }
