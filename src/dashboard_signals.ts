@@ -41,6 +41,7 @@ import type { B2Env } from "./b2";
 import { b2GetBucketUsage } from "./b2";
 import type { QstashEnv } from "./qstash";
 import { qstashListSchedules } from "./qstash";
+import { getReviewCycleSummary } from "./review_cycles";
 
 export type SignalState = "ok" | "warn" | "critical" | "unknown";
 
@@ -374,27 +375,63 @@ async function neo4jKeepalive(env: Neo4jEnv): Promise<HealthSignal> {
 }
 
 // ---- Skipped-cycle rate (Section 10a) ----------------------------------
-// Per the cell prompt's own expectation: the "cycle" concept (a batch of
-// N cells a Reviewer/Architect session reviews together, Section 3b)
-// isn't implemented as real infrastructure anywhere in this codebase.
-// code_cell_workflow.ts posts a per-CodeCell `codecell_resolution`
-// PostHog event with an `escalated` flag as an honest approximation (see
-// posthog_events.ts's own header comment), but there's no aggregation
-// table or cached query result this dashboard can read synchronously on
-// every poll without adding a HogQL round-trip to PostHog's MCP proxy on
-// every single DashboardHub alarm tick -- not worth the latency/failure
-// surface for a signal whose underlying concept doesn't exist yet.
-// Fabricating a number here would be worse than saying so.
+// Real infrastructure now backs this (review_cycles.ts): Section 3b's
+// "cycle" (a batch of N CodeCell resolutions a Reviewer/Architect
+// session would review together) has its own Turso table, closes
+// mechanically on a batch-size or max-age condition, and carries a
+// genuine "did this batch cross the escalation bar, or did the 3b
+// minimum-cadence floor force a review anyway" flag per cycle -- not the
+// old per-CodeCell `escalated` approximation. getReviewCycleSummary()
+// queries that table directly (no HogQL round-trip to PostHog needed on
+// every DashboardHub alarm tick, matching this file's own "query
+// narrowly" discipline above), so this signal is now a real number, not
+// a stub.
 
-function skippedCycleRate(): HealthSignal {
-  return notConfigured(
-    "skipped_cycle_rate",
-    "Skipped-cycle rate (Section 10a)",
-    "Section 3b's 'cycle' concept isn't implemented as real infrastructure yet -- code_cell_workflow.ts " +
-      "posts a per-CodeCell 'codecell_resolution' PostHog event with an 'escalated' flag as an " +
-      "approximation, but there's no aggregation this dashboard can query directly. Wire a HogQL query " +
-      "against that event stream (or a dedicated Turso table) to light this signal up.",
-  );
+async function skippedCycleRate(env: DashboardEnv): Promise<HealthSignal> {
+  const key = "skipped_cycle_rate";
+  const label = "Skipped-cycle rate (Section 10a)";
+  if (!env.TURSO_DATABASE_URL) {
+    return notConfigured(key, label, "TURSO_DATABASE_URL is not configured -- review cycles live in Turso.");
+  }
+  try {
+    const summary = await getReviewCycleSummary(env);
+    const openDetail =
+      `Open cycle #${summary.currentCycle.id}: ${summary.currentCycle.itemCount} item(s), ` +
+      `${summary.currentCycle.escalationCount} escalation(s) so far. ` +
+      `${summary.consecutiveSkipped}/${summary.reviewFloor} consecutive skipped cycles before the floor forces a review.`;
+    if (summary.closedInWindow === 0) {
+      return warn(
+        key,
+        label,
+        "no closed cycles yet",
+        `${openDetail} Nothing has closed a cycle yet -- rate becomes meaningful once the first one does ` +
+          `(batch size or max-age close condition, see review_cycles.ts).`,
+      );
+    }
+    const pct = (summary.skippedRate ?? 0) * 100;
+    const value = `${pct.toFixed(0)}% (${summary.skippedInWindow}/${summary.closedInWindow} of last ${summary.window} closed cycles)`;
+    // 10a, explicitly: "a skipped-cycle rate trending toward zero is a
+    // warning, not a sign of thoroughness" -- HIGH is healthy here
+    // (Layer 0 + Section 4c handling things without a Context Slot,
+    // as intended); LOW means the escalation test has drifted looser
+    // than it should, quietly pulling routine work in front of Claude.
+    // 10a is explicit this is a trend to watch, not a single-number
+    // rule, so treat a low snapshot as worth a glance at the trend
+    // line (Section 12b), not a hard alarm -- 50% is a heuristic
+    // midpoint, not a threshold from the spec itself.
+    if ((summary.skippedRate ?? 0) < 0.5) {
+      return warn(
+        key,
+        label,
+        value,
+        `${openDetail} Rate is on the low side -- worth re-checking what's landing in recent digests ` +
+          `against Section 3b's escalation test rather than assuming more Claude involvement is more thorough.`,
+      );
+    }
+    return ok(key, label, value, openDetail);
+  } catch (e) {
+    return errored(key, label, e);
+  }
 }
 
 // ---- Overall status (Nominal / Degraded / Stalled) ----------------------
@@ -420,13 +457,14 @@ function overallStatus(signals: HealthSignal[]): DashboardPayload["overallStatus
 // ---- Entry point ----------------------------------------------------------
 
 export async function computeDashboardPayload(env: DashboardEnv): Promise<DashboardPayload> {
-  const [stalled, silent, failures, tursoRows, b2Storage, neo4j] = await Promise.all([
+  const [stalled, silent, failures, tursoRows, b2Storage, neo4j, skippedCycle] = await Promise.all([
     stalledWork(env),
     silentPipelineStalls(env),
     failureClustering(env),
     tursoRowsQuota(env),
     b2StorageQuota(env),
     neo4jKeepalive(env),
+    skippedCycleRate(env),
   ]);
   const signals: HealthSignal[] = [
     stalled,
@@ -438,7 +476,7 @@ export async function computeDashboardPayload(env: DashboardEnv): Promise<Dashbo
     qstashMessageQuota(env),
     b2Storage,
     neo4j,
-    skippedCycleRate(),
+    skippedCycle,
   ];
   return {
     generatedAt: new Date().toISOString(),
