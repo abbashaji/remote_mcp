@@ -177,6 +177,16 @@ class_name = "CodeCellWorkflow"
 #                            schedules via Upstash-Forward-Authorization
 #                            (same mechanism FAST_WORKER_CALLBACK_TOKEN
 #                            uses -- see auth.ts and qstash.ts).
+#   PENDING_SWEEP_TOKEN   -- a random secret (e.g. `openssl rand -hex 32`),
+#                            checked on POST /webhook/pending-sweep
+#                            (Section 4a's stuck-Pending backstop). Same
+#                            "own secret, only QStash's schedule ever
+#                            forwards it" reasoning as GRAPH_CRON_TOKEN
+#                            above -- see auth.ts and code_cell_workflow.ts's
+#                            sweepPendingCells. Wire a QStash schedule at
+#                            e.g. `*/10 * * * *` targeting
+#                            $WORKER_URL/webhook/pending-sweep with header
+#                            Upstash-Forward-Authorization: Bearer <this value>.
 #
 # --- Web Push (VAPID) -- out-of-band operator alerts ------------------------
 # Replaces Discord Webhooks' one job (web-push-migration-instructions.md
