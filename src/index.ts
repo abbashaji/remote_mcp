@@ -38,6 +38,7 @@ import { TaskRunner, type RunnerTask } from "./runner";
 import { CodeCellWorkflow, sweepPendingCells } from "./code_cell_workflow";
 import { DashboardHub } from "./dashboard_do";
 import { ensureSchema, createCell, resumeCandidate, writeCheckpoint, getCell } from "./codecells";
+import { getReviewCycleSummary } from "./review_cycles";
 
 // Re-export the Workflow/Durable Object classes so wrangler can find them
 // as binding targets (see [[workflows]] / [[durable_objects.bindings]] +
@@ -89,6 +90,9 @@ export interface Env {
   B2_APPLICATION_KEY?: string; // Backblaze B2 S3-compatible application key secret -- see b2.ts
   B2_BUCKET_NAME?: string; // Backblaze B2 bucket name -- see b2.ts
   B2_ENDPOINT?: string; // Backblaze B2 bucket's S3-compatible endpoint, e.g. "s3.us-west-004.backblazeb2.com" -- see b2.ts
+  CYCLE_BATCH_SIZE?: string; // Section 3b/10a: cycle closes once it holds this many CodeCell resolutions -- defaults to "5", see review_cycles.ts
+  CYCLE_MAX_AGE_HOURS?: string; // Section 3b/10a: cycle closes once it's been open this long, regardless of item_count -- defaults to "24", see review_cycles.ts
+  CYCLE_REVIEW_FLOOR?: string; // Section 3b's minimum-cadence floor: this many consecutive skipped cycles forces the next one to trigger anyway -- defaults to "5", see review_cycles.ts
 }
 
 function text(s: string) {
@@ -1381,6 +1385,29 @@ function buildServer(env: Env): McpServer {
         return text(`Checkpoint written for CodeCell #${cell_id}.`);
       } catch (e) {
         return text(`Error writing checkpoint: ${e}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "cycle_status",
+    {
+      description:
+        "Section 3b/10a: current review-cycle status and skipped-cycle rate (review_cycles.ts). A " +
+        "'cycle' is a batch of CodeCell resolutions Layer 0 accumulates before a Reviewer/Architect " +
+        "Context Slot would pick anything up -- it closes on its own once it hits the configured batch " +
+        "size or max age, and Section 3b's minimum-cadence floor forces a skipped cycle to trigger anyway " +
+        "after enough skips in a row. `window` controls how many recent CLOSED cycles the skipped-cycle " +
+        "rate is computed over (default 20). Useful before starting a batched Reviewer/Architect digest " +
+        "session, or to sanity-check whether Section 3b's escalation test still looks well-calibrated.",
+      inputSchema: { window: z.number().int().positive().default(20) },
+    },
+    async ({ window }) => {
+      try {
+        const summary = await getReviewCycleSummary(env, window);
+        return text(JSON.stringify(summary, null, 2));
+      } catch (e) {
+        return text(`Error getting review-cycle status: ${e}`);
       }
     },
   );
